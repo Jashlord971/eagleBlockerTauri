@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Countdown Progress</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      background: #f4f4f4;
+      padding: 40px;
+      text-align: center;
+    }
+
+    #title {
+      font-size: 24px;
+      margin-bottom: 20px;
+    }
+
+    .progress-container {
+      width: 100%;
+      max-width: 400px;
+      height: 30px;
+      background: #ccc;
+      border-radius: 5px;
+      overflow: hidden;
+      margin: 0 auto 10px auto;
+    }
+
+    .progress-bar {
+      height: 100%;
+      background: #007bff;
+      width: 100%;
+      transition: width 1s linear;
+    }
+
+    #time-left {
+      font-size: 18px;
+      margin-bottom: 20px;
+    }
+
+    #cancelBtn {
+      padding: 10px 20px;
+      background-color: #dc3545;
+      color: white;
+      border: none;
+      border-radius: 5px;
+      font-size: 16px;
+      cursor: pointer;
+    }
+
+    #cancelBtn:hover {
+      background-color: #c82333;
+    }
+  </style>
+</head>
+<body>
+
+<div id="title">Countdown for Setting: <span id="setting-id">N/A</span></div>
+<div class="progress-container">
+  <div class="progress-bar" id="progress-bar"></div>
+</div>
+<div id="time-left">Time left: 0s</div>
+
+<button id="cancelBtn">Cancel Change</button>
+
+<script src="confirmModal.js"></script>
+</body>
+</html>

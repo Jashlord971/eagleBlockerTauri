@@ -1,0 +1,18 @@
+# Rust / Tauri
+/target/
+/src-tauri/target/
+/**/Cargo.lock
+
+# Node / frontend
+/node_modules/
+/dist/
+/build/
+/src-tauri/tauri.conf.json # if you keep secrets elsewhere
+
+# Editor / OS
+.vscode/
+.idea/
+*.log
+.DS_Store
+.env
+*.pem

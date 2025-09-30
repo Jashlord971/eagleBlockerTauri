@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Select Delay Timeout</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+        }
+
+        .modal-content {
+            width: 400px;
+            margin: 100px auto;
+            padding: 20px;
+            border-radius: 10px;
+            background: #002f6c;
+            color: white;
+            box-shadow: 0 0 10px rgba(0,0,0,0.25);
+        }
+
+        h2 {
+            margin-top: 0;
+        }
+
+        .radio-group {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            margin: 20px 0;
+        }
+
+        .radio-option {
+            display: flex;
+            align-items: center;
+        }
+
+        .radio-option input[type="radio"] {
+            margin-right: 10px;
+        }
+
+        .custom-input {
+            margin-left: 28px;
+            margin-top: 5px;
+        }
+
+        .custom-input input {
+            width: 100px;
+            padding: 5px;
+        }
+
+        .button-group {
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+        }
+
+        button {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+
+        #confirmBtn {
+            background-color: #28a745; /* Regular green */
+            color: white;
+            cursor: pointer;
+            opacity: 1;
+            transition: background-color 0.3s ease, opacity 0.3s ease;
+        }
+
+        #confirmBtn:disabled {
+            background-color: #a9d6b5; /* Lighter green */
+            color: white;
+            cursor: not-allowed;
+            opacity: 0.6;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #0047ab;
+            font-family: Arial, sans-serif;
+            color: white;
+        }
+    </style>
+</head>
+<body>
+
+<div class="modal-content" id = "delayTimes">
+    <h2>Select Delay Timeout</h2>
+
+    <span>This controls the wait time before a change is executed. Please note that to switch a delay timeout to a smaller value, you need to wait for the delay timeout at the time of the change to pass. </span>
+    <div class="radio-group">
+        <label class="radio-option"><input type="radio" name="delay" value="0">0 seconds</label>
+        <label class="radio-option"><input type="radio" name="delay" value="3*60*1000">3 minutes</label>
+        <label class="radio-option"><input type="radio" name="delay" value="60 *60 * 1000">1 hour</label>
+        <label class="radio-option"><input type="radio" name="delay" value="6 * 60 * 60 * 1000">6 hours</label>
+        <label class="radio-option"><input type="radio" name="delay" value="12 * 60 * 60 * 1000">12 hours</label>
+        <label class="radio-option"><input type="radio" name="delay" value="24 * 60 * 60 * 1000">1 day</label>
+        <label class="radio-option">
+            <input type="radio" name="delay" value="custom" id="customRadio">
+            Custom (in days)
+        </label>
+        <div class="custom-input" id="customInput" style="display: none;">
+            <input type="number" min="0.1" step="0.1" id="customDays" placeholder="e.g. 2.5"> days
+        </div>
+    </div>
+
+    <div class="button-group">
+        <button id="confirmBtn" disabled>Confirm</button>
+    </div>
+</div>
+
+<div class="modal-content" id="progressContainer" style="display: none;">
+    <h2>Delay timeout change in progress...</h2>
+    <p id="progressLabel">Time remaining: <span id="timeRemaining">--</span></p>
+
+    <div style="background: #666; height: 20px; border-radius: 10px; overflow: hidden;">
+        <div id="progressBar" style="background: #28a745; width: 0%; height: 100%; transition: width 1s;"></div>
+    </div>
+
+    <div style="margin-top: 20px;">
+        <button id="cancelBtn" style="background-color: #dc3545; color: white; border: none; padding: 8px 16px; border-radius: 5px; cursor: pointer;">
+            Cancel
+        </button>
+    </div>
+</div>
+
+<script src = "delaySettings.js"></script>
+
+</body>
+</html>

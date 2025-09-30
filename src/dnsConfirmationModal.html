@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <style>
+
+    .body {
+      margin: 0;
+      padding: 0;
+      background-color: #0047AB;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+    }
+
+    .modal-buttons button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+      background-color: #cccccc;
+      color: #666666;
+    }
+
+    .modal-content {
+      background-color: #0047AB;
+      color: white;
+      padding: 20px;
+      border-radius: 8px;
+      width: 400px;
+      max-width: 90%;
+      box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+      position: relative;
+    }
+
+    .modal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .modal-header h2 {
+      margin: 0;
+      font-size: 20px;
+    }
+
+    .close-btn {
+      font-size: 24px;
+      font-weight: bold;
+      color: white;
+      cursor: pointer;
+      background: none;
+      border: none;
+    }
+
+    .modal-buttons {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      margin-top: 20px;
+    }
+
+    .modal-buttons button {
+      padding: 8px 16px;
+      font-size: 14px;
+      cursor: pointer;
+      border: none;
+      border-radius: 4px;
+      background-color: white;
+      color: #0047AB;
+      font-weight: bold;
+    }
+
+    /* Remove default appearance and style radio button */
+    input[type="radio"] {
+      appearance: none;
+      -webkit-appearance: none;
+      background-color: white;
+      border: 2px solid white;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      margin-right: 6px;
+      cursor: pointer;
+      vertical-align: middle;
+    }
+
+    /* Make the whole circle orange when selected */
+    input[type="radio"]:checked {
+      background-color: orange;
+      border: 2px solid white;
+    }
+
+    /* Add the inner dot for checked state */
+    input[type="radio"]:checked::before {
+      content: '';
+      position: absolute;
+      top: 3px;
+      left: 3px;
+      width: 8px;
+      height: 8px;
+      background-color: white;
+      border-radius: 50%;
+    }
+
+  </style>
+</head>
+<body>
+
+<div class="modal-content">
+  <div class="modal-header">
+    <h2>DNS Protection</h2>
+  </div>
+
+  <p>Which level of dns protection do you want? </p>
+
+  <div class="radio-options" style="margin: 10px 0;">
+    <div>
+      <label style="margin-right: 20px;">
+        <input type="radio" name="approvalOption" value="strict">
+        Strict
+      </label>
+      <p>This blocks adult content, mixed content websites like reddit.com, VPNs for navigating filters, and enforces safe search on Google, YouTube, and Bing.</p>
+    </div>
+
+    <br>
+
+    <div>
+      <label>
+        <input type="radio" name="approvalOption" value="lessStrict">
+        Less Strict
+      </label>
+      <p>This blocks adult content, does not block reddit.com nor VPNs for navigating filters, and does not enforce safe search on Google, YouTube, and Bing.</p>
+    </div>
+  </div>
+
+  <div class="modal-buttons">
+    <button id="confirmBtn" disabled >Confirm</button>
+    <button id="cancelBtn">Cancel</button>
+  </div>
+</div>
+
+<script src ="dnsConfirmationModal.js">
+
+</script>
+
+</body>
+</html>

@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Main Configurations</title>
+    <style>
+        body {
+            background-color: #0047AB;
+            color: white;
+            font-family: sans-serif;
+            margin: 0;
+            padding: 0;
+        }
+
+        /* Menu Bar Styles */
+        .menu-bar {
+            background-color: #003380;
+            padding: 0;
+            display: flex;
+            align-items: center;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
+            position: sticky;
+            top: 0;
+            z-index: 1000;
+        }
+
+        .menu-item {
+            padding: 15px 20px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+            font-weight: 500;
+        }
+
+        .menu-item:hover {
+            background-color: #00264d;
+        }
+
+        .menu-item.active {
+            background-color: #001a33;
+            border-bottom: 3px solid #4CAF50;
+        }
+
+        .container {
+            padding: 20px;
+        }
+
+        h1 {
+            margin-bottom: 20px;
+            font-size: 24px;
+        }
+
+        .pref-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background-color: rgba(255, 255, 255, 0.1);
+            padding: 12px 20px;
+            margin-bottom: 10px;
+            border-radius: 10px;
+        }
+
+        .switch {
+            position: relative;
+            display: inline-block;
+            width: 50px;
+            height: 24px;
+        }
+
+        .switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+
+        .slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: #ccc;
+            border-radius: 24px;
+            transition: 0.4s;
+        }
+
+        .slider:before {
+            position: absolute;
+            content: "";
+            height: 18px;
+            width: 18px;
+            left: 3px;
+            bottom: 3px;
+            background-color: white;
+            border-radius: 50%;
+            transition: 0.4s;
+        }
+
+        input:checked + .slider {
+            background-color: #4CAF50;
+        }
+
+        input:checked + .slider:before {
+            transform: translateX(26px);
+        }
+
+        .pref-row {
+            display: grid;
+            grid-template-columns: 1fr auto auto;
+            align-items: center;
+            gap: 12px;
+            background-color: rgba(255, 255, 255, 0.1);
+            padding: 12px 20px;
+            margin-bottom: 10px;
+            border-radius: 10px;
+        }
+
+        .label-text {
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .info-icon {
+            cursor: pointer;
+            font-size: 18px;
+            color: #FFD700;
+        }
+
+        .tooltip-box {
+            position: absolute;
+            background-color: #222;
+            color: #fff;
+            padding: 10px;
+            border-radius: 6px;
+            font-size: 14px;
+            max-width: 250px;
+            z-index: 9999;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>Main Configurations</h1>
+
+    <div class="pref-row">
+        <div class="label-text">Enable Overlay Over Restricted Content</div>
+        <div class="info-icon" data-description="This shows a fullscreen overlay when restricted apps are opened.">💡</div>
+        <label class="switch">
+            <input type="checkbox" id="overlayRestrictedContent">
+            <span class="slider"></span>
+        </label>
+    </div>
+
+    <div class="pref-row">
+        <div class="label-text">Enable Protective DNS</div>
+        <div class="info-icon" data-description="Protects your searches by filtering adult or harmful content.">💡</div>
+        <label class="switch">
+            <input type="checkbox" id="enableProtectiveDNS">
+            <span class="slider"></span>
+        </label>
+    </div>
+
+    <div class="pref-row">
+        <div class="label-text">Settings and App Protection</div>
+        <div class="info-icon" data-description="Allows the app to block sensitive system settings when enabled. This includes protections against having the app installed">💡</div>
+        <label class="switch">
+            <input type="checkbox" id="blockSettingsSwitch">
+            <span class="slider"></span>
+        </label>
+    </div>
+
+    <div class="pref-row">
+        <div class="label-text">Enforce Safe Search</div>
+        <div class="info-icon" data-description="This enforces safe search on google and bing if your dns settings are not strict">💡</div>
+        <label class="switch">
+            <input type="checkbox" id="enforceSafeSearch">
+            <span class="slider"></span>
+        </label>
+    </div>
+</div>
+
+<script src="mainConfig.js"></script>
+</body>
+</html>

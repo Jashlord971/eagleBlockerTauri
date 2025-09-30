@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <style>
+
+    .body {
+      margin: 0;
+      padding: 0;
+      background-color: #0047AB;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+    }
+
+    .modal-buttons button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+      background-color: #cccccc;
+      color: #666666;
+    }
+
+    .modal-content {
+      background-color: #0047AB;
+      color: white;
+      padding: 20px;
+      border-radius: 8px;
+      width: 400px;
+      max-width: 90%;
+      box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+      position: relative;
+    }
+
+    .modal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .modal-header h2 {
+      margin: 0;
+      font-size: 20px;
+    }
+
+    .close-btn {
+      font-size: 24px;
+      font-weight: bold;
+      color: white;
+      cursor: pointer;
+      background: none;
+      border: none;
+    }
+
+    .modal-buttons {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      margin-top: 20px;
+    }
+
+    .modal-buttons button {
+      padding: 8px 16px;
+      font-size: 14px;
+      cursor: pointer;
+      border: none;
+      border-radius: 4px;
+      background-color: white;
+      color: #0047AB;
+      font-weight: bold;
+    }
+  </style>
+</head>
+<body>
+
+<div class="modal-content" id = "confirm-modal">
+  <div class="modal-header">
+    <h2>Confirm Action</h2>
+  </div>
+
+  <p>Are you sure you would like to disable this configuration? Clicking yes will set a timer and the setting will only be disabled once the delay timeout at the
+    time of prompting has passed. </p>
+
+  <div class="modal-buttons">
+    <button id="confirmBtn" >Confirm</button>
+    <button id="cancelBtn">Cancel</button>
+  </div>
+</div>
+
+<div class="modal-content" id="progressContainer" style="display: none;">
+    <h2>Delay timeout change in progress...</h2>
+    <p id="progressLabel">Time remaining: <span id="timeRemaining">--</span></p>
+
+    <div style="background: #666; height: 20px; border-radius: 10px; overflow: hidden;">
+        <div id="progressBar" style="background: #28a745; width: 0%; height: 100%; transition: width 1s;"></div>
+    </div>
+
+    <div style="margin-top: 20px;">
+        <button id="cancelBtnForProgressBar" style="background-color: #dc3545; color: white; border: none; padding: 8px 16px; border-radius: 5px; cursor: pointer;">
+            Cancel
+        </button>
+    </div>
+</div>
+
+
+<script src = "confirmModal.js">
+
+</script>
+
+</body>
+</html>
