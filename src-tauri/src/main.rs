@@ -26,6 +26,24 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// Windows-only: creation flag to prevent flashing console windows for child processes
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+// Run a program with arguments while hiding the console window on Windows.
+// Returns the Output so callers can inspect stdout/stderr.
+fn run_hidden_output(program: &str, args: &[&str]) -> Result<std::process::Output, String> {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.output().map_err(|e| format!("failed to spawn {}: {}", program, e))
+}
+
 static FILE_IO_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 static ACTIVE_TIMERS: Lazy<Mutex<HashMap<String, (Arc<AtomicBool>, std::thread::JoinHandle<()>, u64)>>> =
@@ -258,9 +276,7 @@ fn turn_on_dns(is_strict: bool, app_handle: tauri::AppHandle) -> Result<(), Stri
 }
 
 fn get_active_interface_name() -> Result<String, String> {
-    let output = Command::new("netsh")
-        .args(["interface", "show", "interface"])
-        .output()
+    let output = run_hidden_output("netsh", &["interface", "show", "interface"]) 
         .map_err(|e| format!("Failed to execute netsh command: {}", e))?;
 
     if !output.status.success() {
@@ -287,10 +303,11 @@ fn get_active_interface_name() -> Result<String, String> {
 }
 
 fn is_safe_dns(interface_name: &str) -> Result<bool, String> {
-    let output = Command::new("netsh")
-        .args(["interface", "ipv4", "show", "dnsservers", "name=", interface_name])
-        .output()
-        .map_err(|e| format!("Failed to execute netsh command: {}", e))?;
+    let output = run_hidden_output(
+        "netsh",
+        &["interface", "ipv4", "show", "dnsservers", "name=", interface_name],
+    )
+    .map_err(|e| format!("Failed to execute netsh command: {}", e))?;
 
     if !output.status.success() {
         return Err("Failed to retrieve DNS settings".to_string());
@@ -305,14 +322,13 @@ fn is_safe_dns(interface_name: &str) -> Result<bool, String> {
 }
 
 fn run_elevated_command(cmd: &str) -> Result<(), String> {
+    // Hide the PowerShell window and UAC parent console while invoking elevation
     let ps = format!(
-        "Start-Process -FilePath 'cmd.exe' -ArgumentList '/C','{}' -Verb RunAs -Wait; exit $LASTEXITCODE",
+        "Start-Process -FilePath 'cmd.exe' -ArgumentList '/C','{}' -Verb RunAs -WindowStyle Hidden -Wait; exit $LASTEXITCODE",
         cmd.replace('\'', r#"'"#)
     );
 
-    let output = Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
-        .output()
+    let output = run_hidden_output("powershell", &["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &ps])
         .map_err(|e| format!("failed to spawn powershell: {}", e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -419,9 +435,7 @@ fn enable_safe_search(app_handle: tauri::AppHandle) -> Result<bool, String>{
 }
 
 fn get_running_process_names() -> Result<HashSet<String>, String> {
-    let output = std::process::Command::new("tasklist")
-        .args(["/FO", "CSV", "/NH"])
-        .output()
+    let output = run_hidden_output("tasklist", &["/FO", "CSV", "/NH"]) 
         .map_err(|e| format!("tasklist spawn failed: {}", e))?;
     if !output.status.success() {
         return Err("tasklist failed".into());
@@ -563,9 +577,7 @@ fn read_preferences_for_key(app_handle: &tauri::AppHandle, key: &str) -> Result<
 fn close_app(process_name: String) -> Result<bool, String> {
     let base = process_name.trim_end_matches(".exe");
     let ps = format!("$proc = Get-Process -Name '{}' -ErrorAction SilentlyContinue; if ($proc) {{ Stop-Process -Name '{}' -Force -ErrorAction SilentlyContinue }}", base, base);
-    let _ = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
-        .output()
+    let _ = run_hidden_output("powershell", &["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &ps])
         .map_err(|e| format!("failed to spawn powershell: {}", e))?;
 
     let start = std::time::Instant::now();
@@ -595,6 +607,24 @@ fn close_confirm_modal(app_handle: tauri::AppHandle){
         &app_handle,
         "close_confirm_modal_prompt",
         serde_json::json!({}),
+    );
+}
+
+#[tauri::command]
+fn close_dns_modal(app_handle: tauri::AppHandle){
+    let _ = tauri::Manager::emit_all(
+        &app_handle,
+        "close_dns_modal_prompt",
+        serde_json::json!({}),
+    );
+}
+
+#[tauri::command]
+fn show_delay_for_priming_deletion(setting_id: String, app_handle: tauri::AppHandle) {
+    let _ = tauri::Manager::emit_all(
+        &app_handle,
+        "show_delay_for_prime_deletion",
+        serde_json::json!({ "settingId": setting_id }),
     );
 }
 
@@ -1460,9 +1490,7 @@ fn create_eagle_task_schedule_simple() -> Result<bool, String> {
     ];
 
     println!("create_eagle_task_schedule_simple: running: schtasks {}", args.join(" "));
-    let output = Command::new("schtasks")
-        .args(&args)
-        .output()
+    let output = run_hidden_output("schtasks", &args)
         .map_err(|e| format!("failed to spawn schtasks: {}", e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1479,9 +1507,7 @@ fn create_eagle_task_schedule_simple() -> Result<bool, String> {
 fn remove_eagle_task_schedule_simple() -> Result<bool, String> {
     let args = ["/Delete", "/TN", TASK_NAME, "/F"];
     println!("remove_eagle_task_schedule_simple: running: schtasks {}", args.join(" "));
-    let output = Command::new("schtasks")
-        .args(&args)
-        .output()
+    let output = run_hidden_output("schtasks", &args)
         .map_err(|e| format!("failed to spawn schtasks: {}", e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1530,6 +1556,21 @@ fn main() {
             Ok(())
         })
         .menu(build_menu())
+        .on_window_event(|event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event.event() {
+                if event.window().label() == "main" {
+                    let should_block = read_preferences_for_key(&event.window().app_handle(), "blockSettingsSwitch").unwrap_or(false);
+                    if should_block {
+                        api.prevent_close();
+                        tauri::api::dialog::message(
+                            Some(&event.window()),
+                            "Action blocked",
+                            "You can’t close the app while Settings and App Protection is ON. Turn it off in Settings to quit."
+                        );
+                    }
+                }
+            }
+        })
         .on_menu_event(|event: WindowMenuEvent| {
             let id = event.menu_item_id();
             let _ = tauri::Manager::emit_all(&event.window().app_handle(), "menu-event", id.to_string());
@@ -1567,7 +1608,9 @@ fn main() {
             prime_for_deletion,
             remove_block_website,
             close_overlay_window,
-            close_confirm_modal
+            close_confirm_modal,
+            close_dns_modal,
+            show_delay_for_priming_deletion
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

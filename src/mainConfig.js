@@ -4,6 +4,7 @@ const { WebviewWindow } = window.__TAURI__.window;
 
 let overlayWindow = null;
 let confirmDialog = null;
+let dnsDialog = null;
 
 window.addEventListener('DOMContentLoaded', () => init());
 
@@ -16,6 +17,8 @@ function init(){
     setUpModalCloser();
     listenForRefresh();
     listenForCloseOfOverlayWindow();
+    listenForDnsModal();
+    listenForPrimeDeletion();
 }
 
 function getPreference(key){
@@ -40,6 +43,9 @@ function openConfirmationDialog(key){
 }
 
 function openDnsStrictnessLevelDialog(){
+    if(dnsDialog){
+        return;
+    }
     const label = `dnsConfirmationModal-${Date.now()}`;
 
     const config = {
@@ -49,7 +55,7 @@ function openDnsStrictnessLevelDialog(){
         height: 250
     };
 
-    const dnsDialog = new WebviewWindow(label, config);
+    dnsDialog = new WebviewWindow(label, config);
     dnsDialog.once('tauri://created', () => console.log("DNS dialog created"));
     dnsDialog.once('tauri://error', (e) => console.error("Failed to create DNS dialog:", e));
 }
@@ -166,34 +172,42 @@ function isSafeSearchEnabled(){
 }
 
 function showOverlay(displayName = '', processName = '') {
-  if (overlayWindow !== null) return;
+    if (overlayWindow !== null) return;
 
-  const label = `overlay-${Date.now()}`;
+    const label = `overlay-${Date.now()}`;
 
-  const url = `overlayWindow.html?displayName=${encodeURIComponent(displayName)}&processName=${encodeURIComponent(processName)}`;
-  overlayWindow = new WebviewWindow(label, {
-    url,
-    title: 'Overlay',
-    //fullscreen: true,
-    decorations: false,
-    transparent: false,
-    alwaysOnTop: true,
-    width: 800,
-    height: 600
-  });
+    const url = `overlayWindow.html?displayName=${encodeURIComponent(displayName)}&processName=${encodeURIComponent(processName)}`;
+    overlayWindow = new WebviewWindow(label, {
+        url,
+        title: 'Overlay',
+        fullscreen: true,
+        decorations: false,
+        transparent: false,
+        alwaysOnTop: true,
+        width: 800,
+        height: 600
+    });
 
-  overlayWindow.once('tauri://destroyed', () => overlayWindow = null);
+    overlayWindow.once('tauri://destroyed', () => overlayWindow = null);
 
-  overlayWindow.once('tauri://created', () => {
-    overlayWindow.emit('appInfo', { displayName, processName });
-    console.log({displayName, processName});
-  });
+    overlayWindow.once('tauri://created', () => {
+        overlayWindow.emit('appInfo', { displayName, processName });
+        console.log({displayName, processName});
+    });
 }
 
 function closeOverlay() {
   if (!overlayWindow) return;
   overlayWindow.close();
   overlayWindow = null;
+}
+
+function closeDnsModal(){
+    if(!dnsDialog){
+        return;
+    }
+    dnsDialog.close();
+    dnsDialog = null;
 }
 
 function initializeFlagListener(){
@@ -229,3 +243,17 @@ function listenForCloseOfOverlayWindow(){
     listen('close_overlay_window_prompted', () => closeOverlay());
 }
 
+function listenForDnsModal(){
+    listen('close_dns_modal_prompt', () => closeDnsModal());
+}
+
+function listenForPrimeDeletion(){
+    listen('show_delay_for_prime_deletion', (event) => {
+        const payload = event?.payload || {};
+        const settingId = payload.settingId;
+
+        if (settingId) {
+            openConfirmationDialog(settingId);
+        }
+    });
+}

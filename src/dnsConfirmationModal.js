@@ -5,7 +5,10 @@ const modal = document.querySelector('.modal-content');
 const cancelBtn = document.getElementById('cancelBtn');
 const confirmBtn = document.getElementById('confirmBtn');
 
-cancelBtn.addEventListener('click', () => modal.style.display = 'none');
+cancelBtn.addEventListener('click', () => {
+    modal.style.display = 'none';
+    closeModal();
+});
 
 radioButtons.forEach(radio => {
     radio.addEventListener('change', (event) => confirmBtn.disabled = !event.target.checked);
@@ -18,4 +21,9 @@ confirmBtn.addEventListener('click', async () => {
     const isStrict = (selectedOption === "strict");
     await turnOnDNS(isStrict);
     modal.style.display = 'none';
+    closeModal();
 });
+
+function closeModal(){
+    invoke('close_dns_modal');
+}

@@ -44,6 +44,16 @@ function getAllInstalledApps() {
         });
 }
 
+
+function createEmptyRow(message) {
+  const row = document.createElement('tr');
+  const cell = document.createElement('td');
+  cell.colSpan = 2;
+  cell.textContent = message;
+  row.appendChild(cell);
+  return row;
+}
+
 function processBlockedAppsAndRenderTable(list) {
     const tbody = document.querySelector('#data-table tbody');
     if (!tbody) return;
@@ -51,6 +61,11 @@ function processBlockedAppsAndRenderTable(list) {
     // clear rows
     if (tbody.replaceChildren) tbody.replaceChildren();
     else tbody.innerHTML = '';
+
+    if (!list || list.length === 0) {
+        tbody.appendChild(createEmptyRow('No apps blocked yet.'));
+        return;
+    }
 
     (list || []).forEach((item, index) => {
         const row = document.createElement('tr');

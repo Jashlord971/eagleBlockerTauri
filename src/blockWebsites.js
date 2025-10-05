@@ -1,22 +1,26 @@
 const { invoke } = window.__TAURI__.tauri;
 const { listen } = window.__TAURI__.event;
+const { WebviewWindow } = window.__TAURI__.window;
 const HOSTS_FILE = 'C:\\Windows\\System32\\drivers\\etc\\hosts';
 
 let list;
+let confirmDialog;
+const setOfEntries = new Set();
 
 function init(){
     if(!window){
         return;
     }
 
-    window.addEventListener('DOMContentLoaded', () => {
+    initializeListener();
+    listenForPrimeDeletion();
+
+    window.addEventListener('DOMContentLoaded', async () => {
         const modal = document.getElementById('modal');
         const input = document.getElementById('modal-input');
         const saveBtn = document.getElementById('save-btn');
         const cancelBtn = document.getElementById('cancel-btn');
         const addBtn = document.getElementById('add-btn');
-
-        void renderTable();
 
         addBtn.addEventListener('click', () => {
             input.value = '';
@@ -35,7 +39,7 @@ function init(){
             return addToBlockListsForWebsites(modal, value)
                 .then(success => {
                     if (success) {
-                        void renderTable();
+                        window.location.reload();
                         modal.style.display = 'none';
                     }
                 })
@@ -44,11 +48,11 @@ function init(){
                     alert(`Failed to block website: ${error.message}`);
                 });
         });
+
+        await renderTable();
     });
 
     window.removeItem = (index) => removeWebsite(index);
-
-    initializeListener();
 }
 
 function removeWebsite(index){
@@ -57,7 +61,10 @@ function removeWebsite(index){
     }
     const site = list[index];
     invoke('remove_block_website', {site})
-        .then(() => renderTable())
+        .then(() => {
+            window.location.reload();
+            setOfEntries.delete(item);
+        })
         .catch(error => console.log(error));
 }
 
@@ -108,11 +115,20 @@ function createDeleteButton(item, index, isAllowedToDelete) {
         if (isAllowedToDelete) {
             removeItem(index);
         } else {
-            const payload = {
-                itemType: "website",
-                name: item
-            }
-            invoke("prime_for_deletion", payload);
+            const key = "allowedForUnblockWebsites-->" + item;
+            invoke("get_change_status", {settingId: key})
+                .then(statusChange => {
+                    if(statusChange.isChanging){
+                        openConfirmationDialog(key);
+                    }
+                    else{
+                        const payload = {
+                            itemType: "website",
+                            name: item
+                        }
+                        invoke("prime_for_deletion", payload);
+                    }
+                });
         }
     };
 
@@ -132,9 +148,13 @@ async function renderTable() {
             else{
                 const allowedWebsitesForDeletions = new Set(Array.from(blockData.allowedForUnblockWebsites ?? []));
                 Array.from(blockedWebsites).forEach((item, index) => {
+                    if(setOfEntries.has(item)){
+                        return;
+                    }
                     const isAllowedToDelete = allowedWebsitesForDeletions.has(item);
                     const row = createDataRow(item, index, isAllowedToDelete);
                     tbody.appendChild(row);
+                    setOfEntries.add(item);
                 });
                 list = Array.from(blockedWebsites);
             }
@@ -159,32 +179,79 @@ function closeModal(modal){
     modal.style.display = 'none';
 }
 
-async function addToBlockListsForWebsites(modal, domain) {
-    const normalizeDomain = (input) => {
-        try {
-            if (!input.startsWith('http')) input = 'http://' + input;
-            const url = new URL(input);
-            let hostname = url.hostname.toLowerCase();
-            return hostname.replace(/^www\./, '');
-        } catch {
-            return null;
-        }
-    }
+function isValidHostname(host) {
+    if (!host || typeof host !== 'string') return false;
+    if (host.length > 253) return false;
+    if (/[^\x20-\x7E]/.test(host)) return false;              
+    if (/[ \t\r\n]/.test(host)) return false;
+    if (host.endsWith('.')) host = host.slice(0, -1);
+    const ipLike = /^\d{1,3}(\.\d{1,3}){3}$/;
+    if (ipLike.test(host)) return false;
+    const label = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)$/i;
+    const parts = host.split('.');
+    if (parts.length < 2) return false;
+    return parts.every(p => label.test(p)) &&
+            (/^[a-z]{2,63}$/i.test(parts[parts.length - 1]) ||
+            /^xn--[a-z0-9-]{2,59}$/i.test(parts[parts.length - 1]));
+}
 
-    if (normalizeDomain(domain) === null) {
-        alert("Invalid website address. Please enter a valid URL.");
+function normalizeHost(input) {
+    let s = String(input || '').trim();
+    if (!s) return null;
+    if (/[\r\n]/.test(s)) return null;
+    if (!/^https?:\/\//i.test(s)) s = 'http://' + s;
+    try {
+        const url = new URL(s);
+        let h = url.hostname.toLowerCase();
+        h = h.replace(/^www\./, '');
+        if (!isValidHostname(h)) return null;
+        return h;
+    } catch {
+        return null;
+    }
+}
+
+async function addToBlockListsForWebsites(modal, domain) {
+    const host = normalizeHost(domain);
+    if (!host) {
+        alert("Please enter a valid website domain (e.g., example.com).");
         return false;
     }
 
-    return invoke('add_block_website', {site: domain})
+    return invoke('add_block_website', { site: host })
         .then(() => {
-            if(modal != null){
+            if (modal) {
                 closeModal(modal);
-                void renderTable();
+                window.location.reload();
             }
+            return true;
         })
         .catch((error) => {
-            console.log(error);
-            alert("Unable to block given website");
+            console.error(error);
+            alert("Unable to block the given website.");
+            return false;
         });
+}
+
+function listenForPrimeDeletion(){
+    listen('show_delay_for_prime_deletion', (event) => {
+        const payload = event?.payload || {};
+        const settingId = payload.settingId;
+
+        if (settingId) {
+            openConfirmationDialog(settingId);
+        }
+    });
+}
+
+function openConfirmationDialog(key){
+    const config = {
+        url: `confirmDialog.html?key=${encodeURIComponent(key)}`,
+        title: 'Delay Status',
+        width: 450,
+        height: 250,
+        alwaysOnTop: true,
+        focus: true
+    };
+    confirmDialog = new WebviewWindow('confirmDialog', config);
 }
