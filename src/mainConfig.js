@@ -15,6 +15,7 @@ function init(){
     initializeFlagListener();
     setUpModalCloser();
     listenForRefresh();
+    listenForCloseOfOverlayWindow();
 }
 
 function getPreference(key){
@@ -22,18 +23,19 @@ function getPreference(key){
 }
 
 function saveSharedPreference(key, value = true){
-    const arguments = { key, value };
-    invoke("save_preference", arguments).then(() => console.log("Preference saved"));
+    const args = { key, value };
+    return invoke("save_preference", args).then(() => console.log("Preference saved"));
 }
 
 function openConfirmationDialog(key){
     const config = {
         url: `confirmDialog.html?key=${encodeURIComponent(key)}`,
-        title: 'Confirm',
+        title: 'Configuration Change',
         width: 450,
-        height: 250
+        height: 250,
+        alwaysOnTop: true,
+        focus: true
     };
-    console.log("key:", key);
     confirmDialog = new WebviewWindow('confirmDialog', config);
 }
 
@@ -48,14 +50,8 @@ function openDnsStrictnessLevelDialog(){
     };
 
     const dnsDialog = new WebviewWindow(label, config);
-
-    dnsDialog.once('tauri://created', () => {
-        console.log("DNS dialog created");
-    });
-
-    dnsDialog.once('tauri://error', (e) => {
-        console.error("Failed to create DNS dialog:", e);
-    });
+    dnsDialog.once('tauri://created', () => console.log("DNS dialog created"));
+    dnsDialog.once('tauri://error', (e) => console.error("Failed to create DNS dialog:", e));
 }
 
 async function initializeOverlaySwitch() {
@@ -76,7 +72,7 @@ async function initializeOverlaySwitch() {
         }
         else {
             saveSharedPreference(key);
-        }
+        } 
     });
 }
 
@@ -150,10 +146,14 @@ async function initializeSafeSearchProtection(){
     safeSearchSwitch.checked = isChecked;
 
     safeSearchSwitch.addEventListener('change', async () => {
-        const isSafeSearchEnabledValue = await getPreference(key) && await isSafeSearchEnabled();
+        const isSafeSearchEnabledLocally = await isSafeSearchEnabled();
+        const isSafeSearchEnabledValue = await getPreference(key) && isSafeSearchEnabledLocally;
         if(isSafeSearchEnabledValue){
             safeSearchSwitch.checked = true;
             openConfirmationDialog(key);
+        }
+        else if(isSafeSearchEnabledLocally){
+            saveSharedPreference(key);
         }
         else{
             invoke('enable_safe_search');
@@ -177,14 +177,12 @@ function showOverlay(displayName = '', processName = '') {
     //fullscreen: true,
     decorations: false,
     transparent: false,
-    //alwaysOnTop: true,
+    alwaysOnTop: true,
     width: 800,
     height: 600
   });
 
-  overlayWindow.once('tauri://destroyed', () => {
-    overlayWindow = null;
-  });
+  overlayWindow.once('tauri://destroyed', () => overlayWindow = null);
 
   overlayWindow.once('tauri://created', () => {
     overlayWindow.emit('appInfo', { displayName, processName });
@@ -199,7 +197,7 @@ function closeOverlay() {
 }
 
 function initializeFlagListener(){
-    listen('flag-app-with-overlay', (event) => {
+    return listen('flag-app-with-overlay', (event) => {
         const { displayName, processName } = event.payload ?? {};
         console.log('flagged process:', displayName, processName);
         showOverlay(displayName, processName);
@@ -214,14 +212,20 @@ function closeConfirmDialog(){
 }
 
 function setUpModalCloser(){
-    listen('closeConfirmModal', (event) => {
+    return listen('close_confirm_modal_prompt', (event) => {
+        console.log("here");
         closeConfirmDialog();
     });
 }
 
 function listenForRefresh(){
-    listen('preferences-updated', () => {
+    return listen('preferences-updated', () => {
         closeConfirmDialog();
         window.location.reload();
     });
 }
+
+function listenForCloseOfOverlayWindow(){
+    listen('close_overlay_window_prompted', () => closeOverlay());
+}
+

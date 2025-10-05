@@ -11,12 +11,11 @@ radioButtons.forEach(radio => {
     radio.addEventListener('change', (event) => confirmBtn.disabled = !event.target.checked);
 });
 
-const turnOnDNS = (isStrict) => invoke('turn_on_dns', {isStrict: true});
+const turnOnDNS = (isStrict) => invoke('turn_on_dns', {isStrict});
 
 confirmBtn.addEventListener('click', async () => {
     const selectedOption = document.querySelector('input[name="approvalOption"]:checked').value;
     const isStrict = (selectedOption === "strict");
-    console.log("turning on dns: " + isStrict);
     await turnOnDNS(isStrict);
-    //modal.style.display = 'none';
+    modal.style.display = 'none';
 });

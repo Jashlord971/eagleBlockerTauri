@@ -1,5 +1,8 @@
 const { invoke } = window.__TAURI__.tauri;
+const { listen } = window.__TAURI__.event;
 const HOSTS_FILE = 'C:\\Windows\\System32\\drivers\\etc\\hosts';
+
+let list;
 
 function init(){
     if(!window){
@@ -43,20 +46,26 @@ function init(){
         });
     });
 
-    window.removeItem = async function(index) {};
+    window.removeItem = (index) => removeWebsite(index);
+
+    initializeListener();
+}
+
+function removeWebsite(index){
+    if(!list || index < 0 || index > list.length){
+        return;
+    }
+    const site = list[index];
+    invoke('remove_block_website', {site})
+        .then(() => renderTable())
+        .catch(error => console.log(error));
+}
+
+function initializeListener(){
+    listen("block-data-updated").then(() => renderTable());
 }
 
 init();
-
-async function getListOfBlockedWebsites(){
-    return invoke('get_block_data')
-        .then(blockData => {
-            if(blockData){
-                return blockData.blockedWebsites;
-            }
-            return [];
-        });
-}
 
 function createEmptyRow(message) {
     const row = document.createElement('tr');
@@ -99,8 +108,11 @@ function createDeleteButton(item, index, isAllowedToDelete) {
         if (isAllowedToDelete) {
             removeItem(index);
         } else {
-            const settingId = `site-->${item}`;
-            ipcRenderer.send('prime-block-for-deletion', settingId);
+            const payload = {
+                itemType: "website",
+                name: item
+            }
+            invoke("prime_for_deletion", payload);
         }
     };
 
@@ -113,20 +125,19 @@ async function renderTable() {
 
     return invoke('get_block_data')
         .then(blockData => {
-            let list = [];
-            if(blockData){
-                list = blockData.blockedWebsites;
-            }
-            if (!list || list.length === 0) {
+            const blockedWebsites = new Set(Array.from(blockData?.blockedWebsites || []));
+            if (!blockedWebsites || blockedWebsites.length === 0) {
                 tbody.appendChild(createEmptyRow("No websites blocked yet."));
-                return;
             }
-            const allowedWebsitesForDeletions = blockData.allowedForUnblockWebsites ?? [];
-            list.forEach((item, index) => {
-                const isAllowedToDelete = allowedWebsitesForDeletions.includes(item);
-                const row = createDataRow(item, index, isAllowedToDelete);
-                tbody.appendChild(row);
-            });
+            else{
+                const allowedWebsitesForDeletions = new Set(Array.from(blockData.allowedForUnblockWebsites ?? []));
+                Array.from(blockedWebsites).forEach((item, index) => {
+                    const isAllowedToDelete = allowedWebsitesForDeletions.has(item);
+                    const row = createDataRow(item, index, isAllowedToDelete);
+                    tbody.appendChild(row);
+                });
+                list = Array.from(blockedWebsites);
+            }
         });
 }
 

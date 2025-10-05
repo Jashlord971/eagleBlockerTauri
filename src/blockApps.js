@@ -1,120 +1,65 @@
 const { invoke } = window.__TAURI__.tauri;
+const { listen } = window.__TAURI__.event;
+
 const filename = 'blockData.json';
 
-let cachedData = {
-    blockedApps: null,
-    installedApps: null,
-    blockData: null
-};
-
-let pendingRequests = {
-    blockedApps: null,
-    installedApps: null,
-    blockData: null
-};
-
-const CACHE_TTL = 5 * 60 * 1000;
-let cacheTimestamps = {
-    installedApps: 0,
-    blockData: 0
-};
-
 function getBlockedAppsList() {
-    if (cachedData.blockedApps) {
-        return Promise.resolve(cachedData.blockedApps);
-    }
-
-    if (pendingRequests.blockedApps) {
-        return pendingRequests.blockedApps;
-    }
-
-    pendingRequests.blockedApps = getBlockData()
+    return getBlockData()
         .then(blockData => {
-            const apps = blockData.blockedApps || [];
-            cachedData.blockedApps = apps;
-            pendingRequests.blockedApps = null;
-            return apps;
+            const blockedApps = blockData?.blockedApps || [];
+            const allowedForDelete = blockData?.allowedForUnblockApps || [];
+            return Array.from(blockedApps)
+                .map(blockedApp => {
+                    const processName = blockedApp.processName;
+                    return {
+                        ...blockedApp,
+                        isAllowedForDelete: allowedForDelete.includes(processName)
+                    }
+                });
         })
         .catch(error => {
             console.error('Failed to get blocked apps:', error);
-            pendingRequests.blockedApps = null;
             return [];
         });
-
-    return pendingRequests.blockedApps;
 }
 
 function getBlockData() {
-    const now = Date.now();
-    const isExpired = now - cacheTimestamps.blockData > CACHE_TTL;
-
-    if (cachedData.blockData && !isExpired) {
-        return Promise.resolve(cachedData.blockData);
-    }
-
-    if (pendingRequests.blockData) {
-        return pendingRequests.blockData;
-    }
-
-    pendingRequests.blockData = invoke('get_block_data')
-        .then(data => {
-            cachedData.blockData = data || { blockedApps: [] };
-            cacheTimestamps.blockData = now;
-            pendingRequests.blockData = null;
-            return cachedData.blockData;
-        })
+    return invoke('get_block_data')
+        .then(data => data || { blockedApps: [] })
         .catch(error => {
             console.error('Failed to get block data:', error);
-            pendingRequests.blockData = null;
             return { blockedApps: [] };
         });
-
-    return pendingRequests.blockData;
 }
 
 function getAllInstalledApps() {
-    const now = Date.now();
-    const isExpired = now - cacheTimestamps.installedApps > CACHE_TTL;
-
-    if (cachedData.installedApps && !isExpired) {
-        return Promise.resolve(cachedData.installedApps);
-    }
-
-    if (pendingRequests.installedApps) {
-        return pendingRequests.installedApps;
-    }
-
-    pendingRequests.installedApps = invoke('get_all_installed_apps')
+    return invoke('get_all_installed_apps')
         .then(apps => {
-            cachedData.installedApps = apps || [];
-            cacheTimestamps.installedApps = now;
-            pendingRequests.installedApps = null;
-            return cachedData.installedApps;
+            console.log("apps:", apps);
+            return apps || [];
         })
         .catch(error => {
             console.error('Failed to get installed apps:', error);
-            pendingRequests.installedApps = null;
             return [];
         });
-
-    return pendingRequests.installedApps;
 }
 
 function processBlockedAppsAndRenderTable(list) {
     const tbody = document.querySelector('#data-table tbody');
     if (!tbody) return;
 
-    tbody.innerHTML = '';
+    // clear rows
+    if (tbody.replaceChildren) tbody.replaceChildren();
+    else tbody.innerHTML = '';
 
-    list.forEach((item, index) => {
+    (list || []).forEach((item, index) => {
         const row = document.createElement('tr');
 
         const nameCell = document.createElement('td');
         nameCell.textContent = item.displayName || 'Unknown App';
 
         const deleteCell = document.createElement('td');
-        const deleteButton = getDeleteButton();
-        deleteButton.onclick = () => removeItem(index);
+        const deleteButton = createDeleteButton(item, index, item?.isAllowedForDelete);
         deleteCell.appendChild(deleteButton);
 
         row.appendChild(nameCell);
@@ -123,9 +68,57 @@ function processBlockedAppsAndRenderTable(list) {
     });
 }
 
+function getButtonTextAndColour(isAllowedToDelete){
+    if(isAllowedToDelete){
+        return {
+            label: "Delete",
+            color: '#fff'
+        }
+    }
+
+    return {
+        color: 'green',
+        label: "Prepare for Deletion"
+    }
+}
+
+function createDeleteButton(item, index, isAllowedToDelete) {
+    const button = document.createElement('button');
+    const { label, color } = getButtonTextAndColour(isAllowedToDelete);
+
+    button.textContent = label;
+    button.style.backgroundColor = '#FF5555';
+    button.style.color = color;
+    button.style.border = 'none';
+    button.style.padding = '5px 10px';
+    button.style.borderRadius = '5px';
+    button.style.cursor = 'pointer';
+
+    button.onclick = () => {
+        if (isAllowedToDelete) {
+            removeItem(index);
+        } else {
+            if(!item || !item.processName || !item.processName.trim()){
+                return false;
+            }
+            const payload = {
+                itemType: "app",
+                name: item.processName
+            }
+            invoke("prime_for_deletion", payload);
+        }
+    };
+
+    return button;
+}
+
+function initializeListener(){
+    listen("block-data-updated").then(() => renderTable());
+}
+
 function renderTable(list = null) {
     if (list) {
-        return processBlockedAppsAndRenderTable(list);
+        return Promise.resolve(processBlockedAppsAndRenderTable(list));
     }
 
     return getBlockedAppsList()
@@ -136,18 +129,6 @@ function renderTable(list = null) {
             console.error('Failed to render table:', error);
             processBlockedAppsAndRenderTable([]);
         });
-}
-
-function getDeleteButton(text = 'Delete') {
-    const button = document.createElement('button');
-    button.textContent = text;
-    button.style.backgroundColor = '#FF5555';
-    button.style.color = '#fff';
-    button.style.border = 'none';
-    button.style.padding = '5px 10px';
-    button.style.borderRadius = '5px';
-    button.style.cursor = 'pointer';
-    return button;
 }
 
 function removeItemAtIndex(index) {
@@ -164,7 +145,6 @@ function removeItemAtIndex(index) {
                 .then(() => {
                     console.log("Deletion of object at index: " + index + " was successful");
                     processBlockedAppsAndRenderTable(updatedList);
-                    cachedData.blockedApps = updatedList;
                 });
         })
         .catch(error => {
@@ -179,12 +159,12 @@ function saveBlockedAppsList(newList) {
                 ...blockData,
                 blockedApps: newList
             };
-
-            invoke('save_block_data', {data: newData});
-
-            cachedData.blockData = newData;
-            cachedData.blockedApps = newList;
-            cacheTimestamps.blockData = Date.now();
+            return invoke('save_block_data', { data: newData })
+                .then(() => newData)
+                .catch(err => {
+                    console.error('Failed to save blocked apps list:', err);
+                    throw err;
+                });
         })
         .catch(error => {
             console.error('Failed to save blocked apps list:', error);
@@ -200,7 +180,6 @@ function renderAppSearchModal() {
     const blockBtn = document.getElementById('blockSelectedBtn');
     const topCancelButton = document.getElementById("closeAppModal");
 
-    // Show loading state
     tbody.innerHTML = '<tr><td colspan="2" style="text-align: center; padding: 20px;">Loading apps...</td></tr>';
     modal.style.display = 'block';
 
@@ -209,8 +188,8 @@ function renderAppSearchModal() {
         getBlockedAppsList()
     ])
         .then(([installedApps, blockedApps]) => {
-            const blockedProcessNames = new Set(blockedApps.map(app => app.processName));
-            const availableApps = installedApps.filter(app =>
+            const blockedProcessNames = new Set((blockedApps || []).map(app => app.processName));
+            const availableApps = (installedApps || []).filter(app =>
                 app.processName && !blockedProcessNames.has(app.processName)
             );
 
@@ -260,7 +239,7 @@ function renderAppSearchModal() {
 
                 return getBlockedAppsList()
                     .then(currentBlockedApps => {
-                        const updatedList = [...currentBlockedApps];
+                        const updatedList = [...(currentBlockedApps || [])];
 
                         checkboxes.forEach(cb => {
                             const processName = cb?.dataset?.processName;
@@ -273,12 +252,8 @@ function renderAppSearchModal() {
 
                         return saveBlockedAppsList(updatedList);
                     })
-                    .then(() => {
-                        return renderTable();
-                    })
-                    .then(() => {
-                        modal.style.display = 'none';
-                    })
+                    .then(() => renderTable())
+                    .then(() => modal.style.display = 'none')
                     .catch(error => {
                         console.error('Failed to block selected apps:', error);
                     });
@@ -307,7 +282,8 @@ window.addEventListener('DOMContentLoaded', () => {
 
     if (title) title.innerText = 'Blocked Apps';
 
-    // Pre-load data
+    initializeListener();
+
     Promise.all([
         getAllInstalledApps(),
         renderTable()
@@ -342,9 +318,6 @@ window.addEventListener('DOMContentLoaded', () => {
 
                     const newData = { ...blockData, blockedApps: list };
                     invoke('save_block_data', { data: newData });
-
-                    cachedData.blockData = newData;
-                    cachedData.blockedApps = list;
 
                     return renderTable();
                 })

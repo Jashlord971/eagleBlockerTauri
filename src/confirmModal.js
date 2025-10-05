@@ -14,6 +14,7 @@ async function init(){
 
     invoke('get_change_status', { settingId })
         .then(statusChange => {
+            console.log("statusChange:", statusChange);
             if(!statusChange.isChanging){
                 return;
             }
@@ -26,8 +27,6 @@ async function init(){
             if(modal && modal.style && modal.style.display){
                 modal.style.display = 'none';
             }
-            console.log(settingId);
-            invoke('cancel_countdown_timer', {settingId});
             closeModal();
         });
     }
@@ -50,7 +49,7 @@ async function init(){
 init();
 
 function closeModal(){
-    emit('closeConfirmModal');
+    invoke('close_confirm_modal');
 }
 
 function showProgressBar(timeRemaining, delayTimeOutAtTimeOfChange){
@@ -63,10 +62,8 @@ function showProgressBar(timeRemaining, delayTimeOutAtTimeOfChange){
     const cancelBtnForProgressBar = document.getElementById('cancelBtnForProgressBar');
     cancelBtnForProgressBar.addEventListener('click', () => {
         confirmBtn.disabled = true;
-        progressContainer.style.display = 'none';
-        delayTimesDialog.style.display = 'block';
-        invoke('cancel_countdown_timer', {settingId});
         closeModal();
+        invoke('cancel_countdown_timer', {settingId});
     });
 
     const endTime = Date.now() + timeRemaining;

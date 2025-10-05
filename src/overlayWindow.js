@@ -45,7 +45,7 @@ function hideElement(id) {
 }
 
 function closeOverlay(){
-    emit('overlay-request-close');
+    invoke('close_overlay_window');
 }
 
 function initializeCloseButton(){
@@ -62,6 +62,7 @@ function initializeCloseButton(){
 
         invoke('close_app', { processName: appInfo.processName })
             .then(result => {
+                console.log("should close the overlay window");
                 if(result){
                     closeOverlay();
                 }

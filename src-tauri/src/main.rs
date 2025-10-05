@@ -1,6 +1,7 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::net::TcpListener;
 use std::fs;
 use std::path::PathBuf;
 use tauri::api::path::app_data_dir;
@@ -32,6 +33,7 @@ static ACTIVE_TIMERS: Lazy<Mutex<HashMap<String, (Arc<AtomicBool>, std::thread::
 
 static PROTECTION_HANDLE: Lazy<Mutex<Option<thread::JoinHandle<()>>>> = Lazy::new(|| Mutex::new(None));
 static PROTECTION_STOP: Lazy<Mutex<Option<Arc<AtomicBool>>>> = Lazy::new(|| Mutex::new(None));
+static CURRENT_PAGE: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
 
 const REQUIRED_ENTRIES : [&str; 7]= [
     "216.239.38.120 www.google.com",
@@ -42,6 +44,8 @@ const REQUIRED_ENTRIES : [&str; 7]= [
     "213.180.204.92 www.yandex.com",
     "127.0.0.1 yandex.com/images",
 ];
+
+const TASK_NAME: &str = "Eagle Task Schedule";
 
 const HOSTS_PATH: &str = r"C:\Windows\System32\drivers\etc\hosts";
 const DELAY_SETTINGS: &str = "delayTimeOut";
@@ -131,23 +135,20 @@ fn read_json_map(path: &PathBuf) -> Result<Map<String, Value>, String> {
 
     let content = fs::read_to_string(path).map_err(|e| format!("read_json_map read error: {}", e))?;
 
-    // Try normal parse
     match serde_json::from_str::<Map<String, Value>>(&content) {
         Ok(map) => return Ok(map),
         Err(parse_err) => {
             eprintln!("read_json_map: failed to parse {}: {}", path.display(), parse_err);
-            // Attempt a best-effort salvage: take substring from first '{' to last '}'
             if let (Some(first), Some(last)) = (content.find('{'), content.rfind('}')) {
                 if last > first {
                     let candidate = &content[first..=last];
                     match serde_json::from_str::<Map<String, Value>>(candidate) {
                         Ok(repaired_map) => {
                             println!("read_json_map: salvage succeeded for {}, backing up original and writing repaired JSON", path.display());
-                            // backup original
+
                             if let Err(e) = backup_corrupted_file(path, &content) {
                                 eprintln!("read_json_map: backup_corrupted_file failed: {}", e);
                             }
-                            // write pretty repaired JSON atomically
                             let pretty = serde_json::to_string_pretty(&repaired_map).map_err(|e| format!("salvaged to_string_pretty error: {}", e))?;
                             let mut tmp = path.clone();
                             tmp.set_extension("tmp");
@@ -236,12 +237,23 @@ fn is_dns_made_safe() -> Result<bool, String> {
 #[tauri::command]
 fn turn_on_dns(is_strict: bool, app_handle: tauri::AppHandle) -> Result<(), String> {
     let interface_name = get_active_interface_name()?;
-    configure_safe_dns(&interface_name, is_strict)?;
+
+    configure_safe_dns(&interface_name, is_strict).map_err(|e| {
+        eprintln!("turn_on_dns: configure_safe_dns failed: {}", e);
+        let elow = e.to_lowercase();
+        if elow.contains("elevation canceled") || elow.contains("canceled by the user") || elow.contains("operation was canceled") {
+            "elevation-canceled-by-user".to_string()
+        } else {
+            format!("configure_safe_dns failed: {}", e)
+        }
+    })?;
+
     save_preference(
         "enableProtectiveDNS".to_string(),
         serde_json::Value::Bool(true),
-        app_handle
+        app_handle,
     )?;
+
     Ok(())
 }
 
@@ -303,18 +315,23 @@ fn run_elevated_command(cmd: &str) -> Result<(), String> {
         .output()
         .map_err(|e| format!("failed to spawn powershell: {}", e))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(format!(
-            "elevated command failed: code={:?}, stdout={}, stderr={}",
-            output.status.code(),
-            stdout,
-            stderr
-        ));
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let code = output.status.code().unwrap_or(-1);
+
+    if output.status.success() {
+        return Ok(());
     }
 
-    Ok(())
+    if code == 1223 || stderr.to_lowercase().contains("canceled by the user") || stderr.to_lowercase().contains("operation was canceled") {
+        println!("Action was canceled by the user");
+        return Err("elevation canceled by user".into());
+    }
+
+    Err(format!(
+        "elevated command failed: code={:?}, stdout={}, stderr={}",
+        code, stdout, stderr
+    ))
 }
 
 fn configure_safe_dns(interface_name: &str, is_strict: bool) -> Result<(), String> {
@@ -427,59 +444,105 @@ fn get_running_process_names() -> Result<HashSet<String>, String> {
     Ok(set)
 }
 
+fn load_block_data(app_handle: &tauri::AppHandle) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let path = get_app_file_path(app_handle, "blockData.json")?;
+    read_json_map(&path)
+}
+
+fn collect_blocked_apps(map: &serde_json::Map<String, serde_json::Value>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Some(serde_json::Value::Array(arr)) = map.get("blockedApps") {
+        for (_i, item) in arr.iter().enumerate() {
+            let proc_opt = item.as_str().map(|s| s.to_string()).or_else(|| {
+                item.get("processName").and_then(|v| v.as_str()).map(|s| s.to_string())
+            });
+            let disp_opt = item.get("displayName").and_then(|v| v.as_str()).map(|s| s.to_string())
+                .or_else(|| proc_opt.clone());
+
+            match proc_opt {
+                Some(proc_name) => {
+                    let display = disp_opt.unwrap_or_else(|| proc_name.clone());
+                    out.push((proc_name, display));
+                }
+                None => {
+                    println!("collect_blocked_apps: skipping entry (no processName): {}", item);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn process_matches_running(proc_name: &str, running: &std::collections::HashSet<String>) -> bool {
+    let norm = proc_name.to_lowercase();
+    let norm_exe = if norm.ends_with(".exe") { norm.clone() } else { format!("{}.exe", norm) };
+    running.iter().any(|r| {
+        let rnorm = r.to_lowercase();
+        rnorm == norm || rnorm == norm_exe
+    })
+}
+
+fn flag_app_overlay(app_handle: &tauri::AppHandle, display: &str, process: &str) {
+    println!("flag_app_overlay: display='{}', process='{}'", display, process);
+    let _ = tauri::Manager::emit_all(
+        app_handle,
+        "flag-app-with-overlay",
+        serde_json::json!({ "displayName": display, "processName": process }),
+    );
+}
+
 #[tauri::command]
 fn turn_on_settings_and_app_protection(app_handle: tauri::AppHandle) -> Result<bool, String> {
-    println!("Turning on settings and app protection");
+    println!("turn_on_settings_and_app_protection: starting");
     let mut guard = PROTECTION_HANDLE.lock().map_err(|e| e.to_string())?;
-    if guard.is_some() { 
-        return Ok(true); 
+    if guard.is_some() {
+        println!("turn_on_settings_and_app_protection: already running");
+        return Ok(true);
     }
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     *PROTECTION_STOP.lock().map_err(|e| e.to_string())? = Some(stop_flag.clone());
 
     let app_clone = app_handle.clone();
-    let handle = thread::spawn(move || {
+    let handle = std::thread::spawn(move || {
         let interval = Duration::from_secs(12);
-        let system_apps = [
-            ("control.exe", "Control Panel"),
-            //("systemsettings.exe", "System settings"),
-            ("mmc.exe", "Task Scheduler"),
-            ("taskmgr.exe", "Task Manager"),
-        ];
         loop {
             if stop_flag.load(Ordering::SeqCst) {
                 break;
             }
-        
+
             let enabled = read_preferences_for_key(&app_clone, "blockSettingsSwitch").unwrap_or(false);
             if enabled {
-                if let Ok(running) = get_running_process_names() {
-                    if let Some((proc, display)) = system_apps.iter().copied().find(|(p, _)| running.contains(&p.to_string())) {
-                        println!("Flagging the app with processName: {}", proc);
-                        let _ = tauri::Manager::emit_all(
-                            &app_clone,
-                            "flag-app-with-overlay",
-                            serde_json::json!({
-                                "displayName": display,
-                                "processName": proc
-                            }),
-                        );
-                        thread::sleep(Duration::from_secs(5));
+                match get_running_process_names() {
+                    Ok(running) => {
+                        if let Ok(block_map) = load_block_data(&app_clone) {
+                            let blocked_apps = collect_blocked_apps(&block_map);
+                            for (proc_name, display_name) in blocked_apps.iter() {
+                                if process_matches_running(proc_name, &running) {
+                                    flag_app_overlay(&app_clone, display_name, proc_name);
+                                    std::thread::sleep(Duration::from_secs(5));
+                                    break;
+                                }
+                            }
+                        }
                     }
+                    Err(e) => eprintln!("protection thread: get_running_process_names failed: {}", e),
                 }
             }
-        
-            thread::sleep(interval);
+
+            std::thread::sleep(interval);
         }
     });
 
     *guard = Some(handle);
+    create_eagle_task_schedule_simple();
+    println!("turn_on_settings_and_app_protection: protection thread started");
     Ok(true)
 }
 
 #[tauri::command]
 fn stop_settings_and_app_protection() -> Result<bool, String> {
+    remove_eagle_task_schedule_simple();
     if let Some(flag) = PROTECTION_STOP.lock().map_err(|e| e.to_string())?.take() {
         flag.store(true, Ordering::SeqCst);
     }
@@ -517,6 +580,24 @@ fn close_app(process_name: String) -> Result<bool, String> {
     Ok(false)
 }
 
+#[tauri::command]
+fn close_overlay_window(app_handle: tauri::AppHandle){
+    let _ = tauri::Manager::emit_all(
+        &app_handle,
+        "close_overlay_window_prompted",
+        serde_json::json!({}),
+    );
+}
+
+#[tauri::command]
+fn close_confirm_modal(app_handle: tauri::AppHandle){
+    let _ = tauri::Manager::emit_all(
+        &app_handle,
+        "close_confirm_modal_prompt",
+        serde_json::json!({}),
+    );
+}
+
 fn build_menu() -> Menu {
     let home = CustomMenuItem::new("menu-home".to_string(), "Home");
     let block_apps = CustomMenuItem::new("menu-block-apps".to_string(), "Block Apps");
@@ -532,13 +613,39 @@ fn build_menu() -> Menu {
 
 fn extract_exe_from_icon(icon: &str) -> String {
     let trimmed = icon.trim().trim_matches('"');
-    let first_part = trimmed.split_whitespace().next().unwrap_or(trimmed);
-    let first_part = first_part.split(',').next().unwrap_or(first_part);
-    Path::new(first_part)
+    let first_part = trimmed.split(',').next().unwrap_or(trimmed).trim();
+
+    if let Some(fname) = std::path::Path::new(first_part)
         .file_name()
         .and_then(|os| os.to_str())
-        .map(|s| s.to_string())
-        .unwrap_or_default()
+    {
+        return fname.to_string();
+    }
+
+    first_part.split_whitespace().last().unwrap_or("").to_string()
+}
+
+fn parse_exe_from_command(cmd: &str) -> String {
+    let s = cmd.trim().trim_matches('"');
+    let first = s.split_whitespace().next().unwrap_or(s);
+    let first = first.split(',').next().unwrap_or(first).trim().trim_matches('"');
+    std::path::Path::new(first)
+        .file_name()
+        .and_then(|os| os.to_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn looks_like_system_displayname(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("update") || n.contains("redistributable") || n.contains("runtime") ||
+    n.contains("driver") || n.contains("package") || n.contains("patch") ||
+    n.contains("microsoft visual c++") || n.contains(".net")
+}
+
+fn looks_like_windows_path(p: &str) -> bool {
+    let lp = p.to_lowercase();
+    lp.contains(r"\windows\") || lp.contains(r"\system32\") || lp.contains(r"\program files\windowsapps")
 }
 
 fn read_uninstall_entries(base: RegKey) -> Vec<(String, String)> {
@@ -548,13 +655,105 @@ fn read_uninstall_entries(base: RegKey) -> Vec<(String, String)> {
             if let Ok(key) = base.open_subkey(&sub) {
                 let display: Option<String> = key.get_value("DisplayName").ok();
                 if let Some(name) = display {
-                    let icon: Option<String> = key.get_value("DisplayIcon").or_else(|_| key.get_value("InstallLocation")).ok();
-                    let process = icon.as_deref().map(extract_exe_from_icon).unwrap_or_default();
+                    if looks_like_system_displayname(&name) {
+                        continue;
+                    }
+
+                    if let Ok(sysc) = key.get_value::<u32, _>("SystemComponent") {
+                        if sysc == 1 {
+                            continue;
+                        }
+                    }
+
+                    if let Ok(release_type) = key.get_value::<String, _>("ReleaseType") {
+                        if release_type.to_lowercase().contains("update") {
+                            continue;
+                        }
+                    }
+
+                    let mut process = String::new();
+
+                    if let Ok(loc) = key.get_value::<String, _>("InstallLocation") {
+                        let p = Path::new(&loc);
+                        if p.is_dir() {
+                            if let Ok(mut entries) = std::fs::read_dir(p).map(|r| r.filter_map(|e| e.ok()).collect::<Vec<_>>()) {
+                                entries.sort_by_key(|e| e.file_name());
+                                if let Some(entry) = entries.into_iter().find(|e| {
+                                    e.path().extension().and_then(|x| x.to_str()).map(|ext| ext.eq_ignore_ascii_case("exe")).unwrap_or(false)
+                                }) {
+                                    process = entry.file_name().to_string_lossy().into_owned();
+                                }
+                            }
+                        }
+                    }
+
+                    if process.is_empty() {
+                        if let Ok(icon) = key.get_value::<String, _>("DisplayIcon") {
+                            let exe = extract_exe_from_icon(&icon);
+                            if !exe.is_empty() && !looks_like_windows_path(&icon) {
+                                process = exe;
+                            }
+                        }
+                    }
+
+                    if process.is_empty() {
+                        if let Ok(uninstall) = key.get_value::<String, _>("UninstallString") {
+                            let exe = parse_exe_from_command(&uninstall);
+                            if !exe.is_empty() && !looks_like_windows_path(&uninstall) {
+                                process = exe;
+                            }
+                        }
+                    }
+
+                    if process.is_empty() {
+                        continue;
+                    }
+                    if looks_like_windows_path(&process) || looks_like_system_displayname(&process) {
+                        continue;
+                    }
+
                     out.push((name, process));
                 }
             }
         }
     }
+    out
+}
+
+fn collect_app_paths() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let roots = [
+        (RegKey::predef(HKEY_LOCAL_MACHINE), r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"),
+        (RegKey::predef(HKEY_CURRENT_USER), r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"),
+    ];
+
+    for (root, sub) in &roots {
+        if let Ok(k) = root.open_subkey(sub) {
+            if let Ok(keys) = k.enum_keys().collect::<Result<Vec<_>, _>>() {
+                for keyname in keys {
+                    if let Ok(k2) = k.open_subkey(&keyname) {
+                        if let Ok(pathval) = k2.get_value::<String, _>("").map(|s| s) {
+                            let exe_name = std::path::Path::new(&pathval)
+                                .file_name()
+                                .and_then(|os| os.to_str())
+                                .unwrap_or("")
+                                .to_string();
+
+                            let display = if keyname.to_lowercase().ends_with(".exe") {
+                                keyname.trim_end_matches(".exe").to_string()
+                            } else {
+                                keyname.clone()
+                            };
+                            if !exe_name.is_empty() {
+                                out.push((display, exe_name));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     out
 }
 
@@ -565,13 +764,21 @@ fn get_all_installed_apps() -> Result<Vec<serde_json::Value>, String> {
     if let Ok(hklm) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall") {
         apps.extend(read_uninstall_entries(hklm));
     }
-    
+
     if let Ok(hklm32) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey("SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall") {
         apps.extend(read_uninstall_entries(hklm32));
     }
 
     if let Ok(hkcu) = RegKey::predef(HKEY_CURRENT_USER).open_subkey("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall") {
         apps.extend(read_uninstall_entries(hkcu));
+    }
+
+    let app_paths = collect_app_paths();
+    if !app_paths.is_empty() {
+        println!("get_all_installed_apps: adding {} entries from App Paths", app_paths.len());
+        for (d, p) in app_paths {
+            apps.push((d, p));
+        }
     }
 
     apps.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
@@ -598,13 +805,8 @@ fn handle_delay_changes(setting_id: String, value: Option<serde_json::Value>,app
     else if setting_id.contains("-->") {
         let parts: Vec<&str> = setting_id.splitn(2, "-->").collect();
         if parts.len() == 2 {
-            let key = parts[0];
+            let key_in_block_data = parts[0];
             let item = parts[1];
-            let key_in_block_data = if key == "site" {
-                "allowedForUnblockWebsites"
-            } else {
-                "allowedForUnblockApps"
-            };
 
             let path = get_app_file_path(&app_handle, "blockData.json")?;
             let mut block_data = read_json_map(&path)?;
@@ -635,8 +837,9 @@ fn handle_delay_changes(setting_id: String, value: Option<serde_json::Value>,app
             let _ = tauri::Manager::emit_all(
                 &app_handle,
                 "block-data-updated",
-                serde_json::json!({ "key": key_in_block_data, "item": item }),
+                serde_json::json!({}),
             );
+
         } else {
             eprintln!("handle_delay_changes: malformed setting_id with delimiter: {}", setting_id);
         }
@@ -655,25 +858,15 @@ fn handle_delay_changes(setting_id: String, value: Option<serde_json::Value>,app
     Ok(())
 }
 
-// Rust
 #[tauri::command]
-fn start_countdown_timer(
-    setting_id: String,
-    remaining_time: Option<u64>,
-    target_timeout: Option<u64>,
-    app_handle: tauri::AppHandle,
-) -> Result<(), String> {
-    // stop existing 3-tuple timer if present
-    if let Some((stop_flag, handle, _end_ts)) =
-        ACTIVE_TIMERS.lock().map_err(|e| e.to_string())?.remove(&setting_id)
-    {
+fn start_countdown_timer(setting_id: String, remaining_time: Option<u64>, target_timeout: Option<u64>, app_handle: tauri::AppHandle) -> Result<(), String> {
+    if let Some((stop_flag, handle, _end_ts)) = ACTIVE_TIMERS.lock().map_err(|e| e.to_string())?.remove(&setting_id){
         println!("start_countdown_timer: stopping existing timer for '{}'", setting_id);
         stop_flag.store(true, Ordering::SeqCst);
         let _ = handle.join();
         println!("start_countdown_timer: existing timer for '{}' stopped", setting_id);
     }
 
-    // determine effective delay (ms)
     let effective_delay = match remaining_time {
         Some(v) => v,
         None => get_delay_time_out(app_handle.clone())?,
@@ -689,7 +882,6 @@ fn start_countdown_timer(
         .map(|d| d.as_millis() as u64)
         .map_err(|e| e.to_string())?;
 
-    // persist minimal timer entry: startTimeStamp and targetTimeout (number or null)
     let path = get_app_file_path(&app_handle, "savedPreferences.json")?;
     let mut prefs = read_json_map(&path)?;
     let mut timer_info = match prefs.get("timerInfo") {
@@ -708,7 +900,7 @@ fn start_countdown_timer(
         } else {
             m.insert("targetTimeout".to_string(), serde_json::Value::Null);
         }
-        // optional: store delayTimeOutAtTimeOfChange
+        
         let configured_timeout_at_change = get_delay_time_out(app_handle.clone()).unwrap_or(effective_delay);
         m.insert(
             "delayTimeOutAtTimeOfChange".to_string(),
@@ -722,7 +914,6 @@ fn start_countdown_timer(
     write_json_map(&path, &prefs)?;
     println!("start_countdown_timer: persisted timerInfo for '{}'", setting_id);
 
-    // compute end timestamp and spawn thread
     let end_ts = start_ts.saturating_add(effective_delay);
 
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -746,7 +937,6 @@ fn start_countdown_timer(
             if now >= end_ts {
                 println!("timer thread: '{}' expired", sid);
 
-                // read persisted numeric targetTimeout (best-effort)
                 let persisted_target_opt: Option<u64> = get_app_file_path(&app_clone, "savedPreferences.json")
                     .ok()
                     .and_then(|p| read_json_map(&p).ok())
@@ -758,7 +948,6 @@ fn start_countdown_timer(
                             .and_then(|v| v.as_u64())
                     });
 
-                // remove persisted timer entry
                 if let Ok(p) = get_app_file_path(&app_clone, "savedPreferences.json") {
                     if let Ok(mut prefs2) = read_json_map(&p) {
                         if let Some(serde_json::Value::Object(ref mut ti)) = prefs2.get_mut("timerInfo") {
@@ -768,7 +957,6 @@ fn start_countdown_timer(
                     }
                 }
 
-                // If this was a delay change, pass target (as JSON Number) to handler; else pass None
                 if sid == DELAY_SETTINGS {
                     if let Some(tv) = persisted_target_opt {
                         let value_to_save = serde_json::Value::Number(serde_json::Number::from(tv));
@@ -786,7 +974,6 @@ fn start_countdown_timer(
                     }
                 }
 
-                // emit timer-expired with numeric target or null
                 let payload = match tt_clone {
                     Some(n) => serde_json::json!({ "settingId": sid, "targetTimeout": n }),
                     None => serde_json::json!({ "settingId": sid, "targetTimeout": serde_json::Value::Null }),
@@ -812,7 +999,6 @@ fn start_countdown_timer(
         }
     });
 
-    // store 3-tuple in ACTIVE_TIMERS
     ACTIVE_TIMERS
         .lock()
         .map_err(|e| e.to_string())?
@@ -821,10 +1007,8 @@ fn start_countdown_timer(
     Ok(())
 }
 
-// Rust
 #[tauri::command]
 fn cancel_countdown_timer(setting_id: String, app_handle: tauri::AppHandle) -> Result<bool, String> {
-    // expect a 3-tuple (stop_flag, handle, end_ts)
     if let Some((stop_flag, handle, _end_ts)) =
         ACTIVE_TIMERS.lock().map_err(|e| e.to_string())?.remove(&setting_id)
     {
@@ -843,7 +1027,6 @@ fn cancel_countdown_timer(setting_id: String, app_handle: tauri::AppHandle) -> R
     Ok(true)
 }
 
-// rust
 #[tauri::command]
 fn get_change_status(setting_id: String, app_handle: tauri::AppHandle) -> Result<serde_json::Value, String> {
     let current_timeout = get_delay_time_out(app_handle.clone())?;
@@ -854,8 +1037,25 @@ fn get_change_status(setting_id: String, app_handle: tauri::AppHandle) -> Result
 
     match ACTIVE_TIMERS.lock() {
         Ok(map) => {
+            // prefer exact match first, then case-insensitive fallback
+            let mut found_key: Option<String> = None;
+            let mut found_end_ts: Option<u64> = None;
+
             if let Some((_, _, end_ts)) = map.get(&setting_id) {
-                let remaining = if *end_ts > now_ms { *end_ts - now_ms } else { 0u64 };
+                found_key = Some(setting_id.clone());
+                found_end_ts = Some(*end_ts);
+            } else {
+                for (k, (_f, _h, end_ts)) in map.iter() {
+                    if k.eq_ignore_ascii_case(&setting_id) {
+                        found_key = Some(k.clone());
+                        found_end_ts = Some(*end_ts);
+                        break;
+                    }
+                }
+            }
+
+            if let (Some(key), Some(end_ts)) = (found_key, found_end_ts) {
+                let remaining = if end_ts > now_ms { end_ts - now_ms } else { 0u64 };
 
                 let delay_at_change = get_app_file_path(&app_handle, "savedPreferences.json")
                     .ok()
@@ -863,7 +1063,7 @@ fn get_change_status(setting_id: String, app_handle: tauri::AppHandle) -> Result
                     .and_then(|prefs_read| {
                         prefs_read.get("timerInfo")
                             .and_then(|ti| ti.as_object())
-                            .and_then(|map| map.get(&setting_id))
+                            .and_then(|map| map.get(&key))
                             .and_then(|entry| {
                                 entry.get("delayTimeOutAtTimeOfChange")
                                      .cloned()
@@ -879,7 +1079,7 @@ fn get_change_status(setting_id: String, app_handle: tauri::AppHandle) -> Result
                     "newValue": serde_json::Value::Null,
                     "delayTimeOutAtTimeOfChange": delay_at_change
                 });
-                println!("get_change_status('{}'): in-memory timer found, returning = {}", setting_id, payload);
+                println!("get_change_status('{}'): in-memory timer found for key='{}', returning = {}", setting_id, key, payload);
                 return Ok(payload);
             }
         }
@@ -897,7 +1097,8 @@ fn get_change_status(setting_id: String, app_handle: tauri::AppHandle) -> Result
         let mut matched_key: Option<String> = None;
         if timer_map.contains_key(&setting_id) {
             matched_key = Some(setting_id.clone());
-        } else {
+        } 
+        else {
             for k in timer_map.keys() {
                 if k.eq_ignore_ascii_case(&setting_id) {
                     matched_key = Some(k.clone());
@@ -916,46 +1117,62 @@ fn get_change_status(setting_id: String, app_handle: tauri::AppHandle) -> Result
             }
         }
 
-        if let Some(key) = matched_key {
-            if let Some(entry) = timer_map.get(&key) {
-                println!("get_change_status('{}'): matched timerInfo key = '{}', entry = {}", setting_id, key, entry);
+        if let Some(serde_json::Value::Object(timer_map)) = prefs.get("timerInfo") {
+            let mut matched_key: Option<String> = None;
+            if timer_map.contains_key(&setting_id) {
+                matched_key = Some(setting_id.clone());
+            } else {
+                for k in timer_map.keys() {
+                    if k.eq_ignore_ascii_case(&setting_id) {
+                        matched_key = Some(k.clone());
+                        break;
+                    }
+                }
+            }
 
-                let delay_ms = current_timeout;
+            if let Some(key) = matched_key {
+                if let Some(entry) = timer_map.get(&key) {
+                    println!("get_change_status('{}'): matched timerInfo key = '{}', entry = {}", setting_id, key, entry);
 
-                let start_ts = entry
-                    .get("startTimeStamp")
-                    .and_then(|v| v.as_u64())
-                    .or_else(|| entry.get("startTimeStamp").and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok()))
-                    .unwrap_or(now_ms);
+                    let delay_ms = current_timeout;
 
-                let end_ts = start_ts.saturating_add(delay_ms);
-                let remaining = if end_ts > now_ms { end_ts - now_ms } else { 0u64 };
+                    let start_ts = entry
+                        .get("startTimeStamp")
+                        .and_then(|v| v.as_u64())
+                        .or_else(|| entry.get("startTimeStamp").and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok()))
+                        .unwrap_or(now_ms);
 
-                let new_value = entry
-                    .get("targetTimeout")
-                    .cloned()
-                    .or_else(|| entry.get("newDelayValue").cloned())
-                    .unwrap_or(serde_json::Value::Null);
+                    let end_ts = start_ts.saturating_add(delay_ms);
+                    let remaining = if end_ts > now_ms { end_ts - now_ms } else { 0u64 };
 
-                let delay_at_change = entry
-                    .get("delayTimeOutAtTimeOfChange")
-                    .cloned()
-                    .or_else(|| entry.get("delayTimeoutAtTimeOfChange").cloned())
-                    .unwrap_or(serde_json::Value::Null);
+                    let new_value = entry
+                        .get("targetTimeout")
+                        .cloned()
+                        .or_else(|| entry.get("newDelayValue").cloned())
+                        .unwrap_or(serde_json::Value::Null);
 
-                let payload = json!({
-                    "currentTimeout": current_timeout,
-                    "isChanging": true,
-                    "timeRemaining": remaining,
-                    "newValue": new_value,
-                    "delayTimeOutAtTimeOfChange": delay_at_change
-                });
+                    let delay_at_change = entry
+                        .get("delayTimeOutAtTimeOfChange")
+                        .cloned()
+                        .or_else(|| entry.get("delayTimeoutAtTimeOfChange").cloned())
+                        .unwrap_or(serde_json::Value::Null);
 
-                println!("get_change_status('{}'): returning = {}", setting_id, payload);
-                return Ok(payload);
+                    let payload = json!({
+                        "currentTimeout": current_timeout,
+                        "isChanging": true,
+                        "timeRemaining": remaining,
+                        "newValue": new_value,
+                        "delayTimeOutAtTimeOfChange": delay_at_change
+                    });
+
+                    println!("get_change_status('{}'): returning = {}", setting_id, payload);
+                    return Ok(payload);
+                }
+            } else {
+                println!("get_change_status('{}'): no matching timerInfo key found (tried '{}')", setting_id, setting_id);
             }
         } else {
-            println!("get_change_status('{}'): no matching timerInfo key found (tried '{}')", setting_id, setting_id);
+            println!("get_change_status('{}'): no timerInfo object in prefs", setting_id);
         }
     } else {
         println!("get_change_status('{}'): no timerInfo object in prefs", setting_id);
@@ -1058,6 +1275,97 @@ fn add_block_website(site: String, app_handle: tauri::AppHandle) -> Result<bool,
     Ok(true)
 }
 
+#[tauri::command]
+fn remove_block_website(site: String, app_handle: tauri::AppHandle) -> Result<bool, String> {
+    let site = site.trim();
+    if site.is_empty() {
+        return Err("empty site".into());
+    }
+
+    println!("remove_block_website: removing {}", site);
+
+    let current = std::fs::read_to_string(HOSTS_PATH)
+        .map_err(|e| format!("failed to read hosts file: {}", e))?;
+
+    let pattern = format!(r"(?m)^\s*127\.0\.0\.1\s+{}\b.*\r?\n?", regex::escape(site));
+    let re = Regex::new(&pattern).map_err(|e| e.to_string())?;
+    let new_content = re.replace_all(&current, "").to_string();
+
+    if new_content == current {
+        println!("remove_block_website: hosts had no entry for '{}', skipping hosts edit", site);
+    } else {
+        let mut tmp_path = env::temp_dir();
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis().to_string()).unwrap_or_else(|_| "tmp".into());
+        tmp_path.push(format!("eagleblocker_hosts_rm_{}.tmp", suffix));
+        let tmp_path_str = tmp_path.to_string_lossy().into_owned();
+
+        std::fs::write(&tmp_path, new_content.as_bytes()).map_err(|e| format!("failed to write temp hosts file: {}", e))?;
+        let cmd = format!("move /Y \"{}\" \"{}\"", tmp_path_str.replace('"', ""), HOSTS_PATH);
+
+        if let Err(e) = run_elevated_command(&cmd) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!("elevated move failed: {}", e));
+        }
+
+        let after = std::fs::read_to_string(HOSTS_PATH).map_err(|e| format!("failed to read hosts after elevation: {}", e))?;
+        if re.is_match(&after) {
+            return Err("hosts file still contains entry after elevated update".into());
+        }
+
+        println!("remove_block_website: hosts updated successfully for '{}'", site);
+    }
+
+    let path = get_app_file_path(&app_handle, "blockData.json")?;
+    let mut block_data = read_json_map(&path)?;
+    let mut changed = false;
+
+    if let Some(serde_json::Value::Array(ref mut arr)) = block_data.get_mut("blockedWebsites") {
+        let before = arr.len();
+        arr.retain(|v| v.as_str().map(|s| s != site).unwrap_or(true));
+        if arr.len() != before {
+            println!("remove_block_website: removed '{}' from blockedWebsites", site);
+            changed = true;
+        } else {
+            println!("remove_block_website: '{}' not found in blockedWebsites", site);
+        }
+    }
+
+    if let Some(serde_json::Value::Array(ref mut arr)) = block_data.get_mut("allowedForUnblockWebsites") {
+        let before = arr.len();
+        arr.retain(|v| v.as_str().map(|s| s != site).unwrap_or(true));
+        if arr.len() != before {
+            println!("remove_block_website: removed '{}' from allowedForUnblockWebsites", site);
+            changed = true;
+        }
+    }
+
+    if changed {
+        write_json_map(&path, &block_data)?;
+        let _ = tauri::Manager::emit_all(
+            &app_handle,
+            "block-data-updated",
+            serde_json::json!({ "key": "blockedWebsites", "item": site }),
+        );
+    }
+
+    Ok(true)
+}
+
+#[tauri::command]
+fn prime_for_deletion(item_type: String, name: String, app_handle: tauri::AppHandle) -> Result<bool, String> {
+    let kind = item_type.to_lowercase();
+    let key = if kind == "website" { "allowedForUnblockWebsites" } else { "allowedForUnblockApps" };
+
+    let setting_id = format!("{}-->{}", key, name);
+
+    println!("prime_for_deletion: priming '{}' for deletion (setting_id='{}')", name, setting_id);
+
+    start_countdown_timer(setting_id.clone(), None, None, app_handle.clone())
+        .map_err(|e| format!("prime_for_deletion: failed to start timer: {}", e))?;
+
+    Ok(true)
+}
+
 fn reactivate_timers(app_handle: &tauri::AppHandle) -> Result<(), String> {
     let path = get_app_file_path(app_handle, "savedPreferences.json")?;
     let prefs = read_json_map(&path)?;
@@ -1125,20 +1433,106 @@ fn reactivate_timers(app_handle: &tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+fn create_eagle_task_schedule_simple() -> Result<bool, String> {
+    let default_app_path: Option<&str> = Some(r"C:\Program Files\Eagle Blocker\Eagle Blocker.exe");
+
+    let exe_path = if let Some(p) = default_app_path {
+        p.to_string()
+    } else {
+        std::env::current_exe()
+            .map_err(|e| format!("failed to determine current exe path: {}", e))?
+            .to_string_lossy()
+            .into_owned()
+    };
+
+    let tr_value = format!("\"{}\"", exe_path.replace('"', "\\\""));
+    let args = [
+        "/Create",
+        "/F",
+        "/SC",
+        "MINUTE",
+        "/MO",
+        "1",
+        "/TN",
+        TASK_NAME,
+        "/TR",
+        &tr_value,
+    ];
+
+    println!("create_eagle_task_schedule_simple: running: schtasks {}", args.join(" "));
+    let output = Command::new("schtasks")
+        .args(&args)
+        .output()
+        .map_err(|e| format!("failed to spawn schtasks: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if output.status.success() {
+        println!("create_eagle_task_schedule_simple: succeeded: {}", stdout);
+        Ok(true)
+    } else {
+        Err(format!("schtasks failed: code={:?}, stdout={}, stderr={}", output.status.code(), stdout, stderr))
+    }
+}
+
+fn remove_eagle_task_schedule_simple() -> Result<bool, String> {
+    let args = ["/Delete", "/TN", TASK_NAME, "/F"];
+    println!("remove_eagle_task_schedule_simple: running: schtasks {}", args.join(" "));
+    let output = Command::new("schtasks")
+        .args(&args)
+        .output()
+        .map_err(|e| format!("failed to spawn schtasks: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if output.status.success() {
+        println!("remove_eagle_task_schedule_simple: succeeded: {}", stdout);
+        Ok(true)
+    } else {
+        Err(format!("schtasks delete failed: code={:?}, stdout={}, stderr={}", output.status.code(), stdout, stderr))
+    }
+}
+
+fn register_page_change_menu_handler(app: &tauri::App) {
+    let app_handle = app.handle();
+    let app_handle_clone = app_handle.clone();
+
+    app.listen_global("page-changed", move |event| {
+        if let Some(payload) = event.payload() {
+            if let Ok(mut cp) = CURRENT_PAGE.lock() {
+                *cp = payload.to_string();
+                println!("register_page_change_menu_handler: current page = {}", payload);
+            }
+            let _ = app_handle_clone.emit_all("page-changed-ack", None::<()>);
+        }
+    });
+}
 
 fn main() {
+    const LOCK_ADDR: &str = "127.0.0.1:58859";
+    let _lock = match TcpListener::bind(LOCK_ADDR) {
+        Ok(l) => l,
+        Err(_) => {
+            println!("Another instance is running; exiting.");
+            return;
+        }
+    };
+
     tauri::Builder::default()
         .setup(|app| {
             let app_handle = app.app_handle();
             if let Err(e) = reactivate_timers(&app_handle) {
                 eprintln!("reactivate_timers failed during setup: {}", e);
             }
+            register_page_change_menu_handler(app);
             Ok(())
         })
         .menu(build_menu())
         .on_menu_event(|event: WindowMenuEvent| {
             let id = event.menu_item_id();
-            let _ = tauri::Manager::emit_all(&event.window().app_handle(),"menu-event", id.to_string());
+            let _ = tauri::Manager::emit_all(&event.window().app_handle(), "menu-event", id.to_string());
 
             if let Some(page) = menu_id_to_page(id) {
                 let app = event.window().app_handle();
@@ -1169,7 +1563,11 @@ fn main() {
             get_delay_change_status,
             stop_settings_and_app_protection,
             add_block_website,
-            get_change_status
+            get_change_status,
+            prime_for_deletion,
+            remove_block_website,
+            close_overlay_window,
+            close_confirm_modal
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
