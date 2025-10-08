@@ -32,9 +32,8 @@ use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-// Run a program with arguments while hiding the console window on Windows.
-// Returns the Output so callers can inspect stdout/stderr.
 fn run_hidden_output(program: &str, args: &[&str]) -> Result<std::process::Output, String> {
+    println!("run_hidden_output: {} {}", program, args.join(" "));
     let mut cmd = Command::new(program);
     cmd.args(args);
     #[cfg(windows)]
@@ -63,8 +62,13 @@ const REQUIRED_ENTRIES : [&str; 7]= [
     "127.0.0.1 yandex.com/images",
 ];
 
-const TASK_NAME: &str = "Eagle Task Schedule";
+const PROTECTED_SYSTEM_APPS : [(&str, &[&str]); 3] = [
+    ("Task Manager", &["taskmgr.exe"]),
+    ("Task Scheduler", &["mmc.exe"]),
+    ("Control Panel", &["control.exe"])
+];
 
+const TASK_NAME: &str = "Eagle Task Schedule";
 const HOSTS_PATH: &str = r"C:\Windows\System32\drivers\etc\hosts";
 const DELAY_SETTINGS: &str = "delayTimeOut";
 
@@ -111,7 +115,7 @@ fn save_preference(key: String, value: serde_json::Value, app_handle: tauri::App
         Err(e) => println!("Failed to read back preferences after write: {}", e),
     }
 
-    tauri::Manager::emit_all(&app_handle, "preferences-updated", serde_json::Value::Null).ok();
+    close_confirmation_dialog(app_handle);
 
     Ok(())
 }
@@ -182,7 +186,6 @@ fn read_json_map(path: &PathBuf) -> Result<Map<String, Value>, String> {
                     }
                 }
             }
-            // no salvage possible
             eprintln!("read_json_map: no salvage possible for {}, backing up and returning empty prefs", path.display());
             let _ = backup_corrupted_file(path, &content);
             return Ok(Map::new());
@@ -496,15 +499,6 @@ fn process_matches_running(proc_name: &str, running: &std::collections::HashSet<
     })
 }
 
-fn flag_app_overlay(app_handle: &tauri::AppHandle, display: &str, process: &str) {
-    println!("flag_app_overlay: display='{}', process='{}'", display, process);
-    let _ = tauri::Manager::emit_all(
-        app_handle,
-        "flag-app-with-overlay",
-        serde_json::json!({ "displayName": display, "processName": process }),
-    );
-}
-
 #[tauri::command]
 fn turn_on_settings_and_app_protection(app_handle: tauri::AppHandle) -> Result<bool, String> {
     println!("turn_on_settings_and_app_protection: starting");
@@ -525,19 +519,37 @@ fn turn_on_settings_and_app_protection(app_handle: tauri::AppHandle) -> Result<b
                 break;
             }
 
-            let enabled = read_preferences_for_key(&app_clone, "blockSettingsSwitch").unwrap_or(false);
+            let is_settings_protection_on = read_preferences_for_key(&app_clone, "blockSettingsSwitch").unwrap_or(false);
+            let is_overlay_protection_on = read_preferences_for_key(&app_clone, "overlayRestrictedContent").unwrap_or(false);
+            let enabled = is_settings_protection_on && is_overlay_protection_on;
             if enabled {
                 match get_running_process_names() {
                     Ok(running) => {
-                        if let Ok(block_map) = load_block_data(&app_clone) {
-                            let blocked_apps = collect_blocked_apps(&block_map);
-                            for (proc_name, display_name) in blocked_apps.iter() {
-                                if process_matches_running(proc_name, &running) {
-                                    flag_app_overlay(&app_clone, display_name, proc_name);
-                                    std::thread::sleep(Duration::from_secs(5));
-                                    break;
+                        let mut has_flagged = false;
+                        for (display, procs) in PROTECTED_SYSTEM_APPS.iter() {
+                            if procs.iter().any(|p| running.contains(*p)) {
+                                show_overlay(&app_clone, display, procs[0]);
+                                has_flagged = true;
+                                break;
+                            }
+                        }
+
+                        if has_flagged == false {
+                            if let Ok(block_map) = load_block_data(&app_clone) {
+                                let blocked_apps = collect_blocked_apps(&block_map);
+                                for (proc_name, display_name) in blocked_apps.iter() {
+                                    if process_matches_running(proc_name, &running) {
+                                        show_overlay(&app_clone, display_name, proc_name);
+                                        std::thread::sleep(Duration::from_secs(5));
+                                        has_flagged = true;
+                                        break;
+                                    }
                                 }
                             }
+                        }
+
+                        if has_flagged == false {
+                            close_overlay_window(app_clone.clone());
                         }
                     }
                     Err(e) => eprintln!("protection thread: get_running_process_names failed: {}", e),
@@ -549,14 +561,14 @@ fn turn_on_settings_and_app_protection(app_handle: tauri::AppHandle) -> Result<b
     });
 
     *guard = Some(handle);
-    create_eagle_task_schedule_simple();
+    let _ = create_eagle_task_schedule_simple();
     println!("turn_on_settings_and_app_protection: protection thread started");
     Ok(true)
 }
 
 #[tauri::command]
 fn stop_settings_and_app_protection() -> Result<bool, String> {
-    remove_eagle_task_schedule_simple();
+    let _ = remove_eagle_task_schedule_simple();
     if let Some(flag) = PROTECTION_STOP.lock().map_err(|e| e.to_string())?.take() {
         flag.store(true, Ordering::SeqCst);
     }
@@ -593,30 +605,29 @@ fn close_app(process_name: String) -> Result<bool, String> {
 }
 
 #[tauri::command]
+fn close_invoking_window(window: tauri::Window) -> Result<(), String> {
+    window.close().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn close_overlay_window(app_handle: tauri::AppHandle){
-    let _ = tauri::Manager::emit_all(
-        &app_handle,
-        "close_overlay_window_prompted",
-        serde_json::json!({}),
-    );
+    close_window(&app_handle, "overlay_window");
 }
 
 #[tauri::command]
-fn close_confirm_modal(app_handle: tauri::AppHandle){
-    let _ = tauri::Manager::emit_all(
-        &app_handle,
-        "close_confirm_modal_prompt",
-        serde_json::json!({}),
-    );
+fn close_confirmation_dialog(app_handle: tauri::AppHandle){
+    close_window(&app_handle, "confirmDialog");
 }
 
-#[tauri::command]
-fn close_dns_modal(app_handle: tauri::AppHandle){
-    let _ = tauri::Manager::emit_all(
-        &app_handle,
-        "close_dns_modal_prompt",
-        serde_json::json!({}),
-    );
+fn close_window(app_handle: &tauri::AppHandle, given_label: &str){
+    let mut closed = 0u32;
+    for (label, win) in app_handle.windows() {
+        if label == given_label {
+            let _ = win.close();
+            closed += 1;
+        }
+    }
+    println!("close_window: closed {} {} window(s)", closed, given_label);
 }
 
 #[tauri::command]
@@ -1039,6 +1050,7 @@ fn start_countdown_timer(setting_id: String, remaining_time: Option<u64>, target
 
 #[tauri::command]
 fn cancel_countdown_timer(setting_id: String, app_handle: tauri::AppHandle) -> Result<bool, String> {
+    println!("ending countdown timer for {}", setting_id);
     if let Some((stop_flag, handle, _end_ts)) =
         ACTIVE_TIMERS.lock().map_err(|e| e.to_string())?.remove(&setting_id)
     {
@@ -1065,70 +1077,74 @@ fn get_change_status(setting_id: String, app_handle: tauri::AppHandle) -> Result
         .map(|d| d.as_millis() as u64)
         .map_err(|e| e.to_string())?;
 
+    // Debug: dump in-memory active timers keys
     match ACTIVE_TIMERS.lock() {
         Ok(map) => {
-            // prefer exact match first, then case-insensitive fallback
-            let mut found_key: Option<String> = None;
-            let mut found_end_ts: Option<u64> = None;
+            let keys: Vec<String> = map.keys().cloned().collect();
+            println!("get_change_status: ACTIVE_TIMERS keys = {:?}", keys);
 
+            // exact match first
             if let Some((_, _, end_ts)) = map.get(&setting_id) {
-                found_key = Some(setting_id.clone());
-                found_end_ts = Some(*end_ts);
-            } else {
-                for (k, (_f, _h, end_ts)) in map.iter() {
-                    if k.eq_ignore_ascii_case(&setting_id) {
-                        found_key = Some(k.clone());
-                        found_end_ts = Some(*end_ts);
-                        break;
-                    }
-                }
-            }
-
-            if let (Some(key), Some(end_ts)) = (found_key, found_end_ts) {
-                let remaining = if end_ts > now_ms { end_ts - now_ms } else { 0u64 };
-
-                let delay_at_change = get_app_file_path(&app_handle, "savedPreferences.json")
-                    .ok()
-                    .and_then(|p| read_json_map(&p).ok())
-                    .and_then(|prefs_read| {
-                        prefs_read.get("timerInfo")
-                            .and_then(|ti| ti.as_object())
-                            .and_then(|map| map.get(&key))
-                            .and_then(|entry| {
-                                entry.get("delayTimeOutAtTimeOfChange")
-                                     .cloned()
-                                     .or_else(|| entry.get("delayTimeoutAtTimeOfChange").cloned())
-                            })
-                    })
-                    .unwrap_or(serde_json::Value::Null);
-
+                let remaining = if *end_ts > now_ms { *end_ts - now_ms } else { 0u64 };
                 let payload = json!({
                     "currentTimeout": current_timeout,
                     "isChanging": true,
                     "timeRemaining": remaining,
                     "newValue": serde_json::Value::Null,
-                    "delayTimeOutAtTimeOfChange": delay_at_change
+                    "delayTimeOutAtTimeOfChange": serde_json::Value::Null
                 });
-                println!("get_change_status('{}'): in-memory timer found for key='{}', returning = {}", setting_id, key, payload);
+                println!("get_change_status('{}'): in-memory exact match -> {:?}", setting_id, payload);
                 return Ok(payload);
+            }
+
+            // case-insensitive fallback
+            for (k, (_stop, _h, end_ts)) in map.iter() {
+                if k.eq_ignore_ascii_case(&setting_id) {
+                    let remaining = if *end_ts > now_ms { *end_ts - now_ms } else { 0u64 };
+
+                    // try to pick up delayTimeOutAtTimeOfChange from prefs (if present)
+                    let delay_at_change = get_app_file_path(&app_handle, "savedPreferences.json")
+                        .ok()
+                        .and_then(|p| read_json_map(&p).ok())
+                        .and_then(|prefs_read| {
+                            prefs_read.get("timerInfo")
+                                .and_then(|ti| ti.as_object())
+                                .and_then(|map| map.get(k))
+                                .and_then(|entry| {
+                                    entry.get("delayTimeOutAtTimeOfChange")
+                                         .cloned()
+                                         .or_else(|| entry.get("delayTimeoutAtTimeOfChange").cloned())
+                                })
+                        })
+                        .unwrap_or(serde_json::Value::Null);
+
+                    let payload = json!({
+                        "currentTimeout": current_timeout,
+                        "isChanging": true,
+                        "timeRemaining": remaining,
+                        "newValue": serde_json::Value::Null,
+                        "delayTimeOutAtTimeOfChange": delay_at_change
+                    });
+                    println!("get_change_status('{}'): in-memory case-insensitive match '{}' -> {:?}", setting_id, k, payload);
+                    return Ok(payload);
+                }
             }
         }
         Err(e) => eprintln!("get_change_status: failed to lock ACTIVE_TIMERS: {}", e),
     }
 
+    // Fallback: check persisted prefs timerInfo
     let path = get_app_file_path(&app_handle, "savedPreferences.json")?;
     let prefs = read_json_map(&path)?;
 
-    if let Ok(s) = serde_json::to_string_pretty(&serde_json::Value::Object(prefs.clone())) {
-        println!("get_change_status('{}'): prefs =\n{}", setting_id, s);
-    }
-
     if let Some(serde_json::Value::Object(timer_map)) = prefs.get("timerInfo") {
+        println!("get_change_status('{}'): prefs.timerInfo keys = {:?}", setting_id, timer_map.keys().cloned().collect::<Vec<_>>());
+
+        // prefer exact key then case-insensitive
         let mut matched_key: Option<String> = None;
         if timer_map.contains_key(&setting_id) {
             matched_key = Some(setting_id.clone());
-        } 
-        else {
+        } else {
             for k in timer_map.keys() {
                 if k.eq_ignore_ascii_case(&setting_id) {
                     matched_key = Some(k.clone());
@@ -1136,73 +1152,44 @@ fn get_change_status(setting_id: String, app_handle: tauri::AppHandle) -> Result
                 }
             }
         }
-        if matched_key.is_none() {
-            for (k, v) in timer_map.iter() {
-                if let Some(obj) = v.as_object() {
-                    if obj.contains_key("startTimeStamp") {
-                        matched_key = Some(k.clone());
-                        break;
-                    }
-                }
-            }
-        }
 
-        if let Some(serde_json::Value::Object(timer_map)) = prefs.get("timerInfo") {
-            let mut matched_key: Option<String> = None;
-            if timer_map.contains_key(&setting_id) {
-                matched_key = Some(setting_id.clone());
-            } else {
-                for k in timer_map.keys() {
-                    if k.eq_ignore_ascii_case(&setting_id) {
-                        matched_key = Some(k.clone());
-                        break;
-                    }
-                }
-            }
+        if let Some(key) = matched_key {
+            if let Some(entry) = timer_map.get(&key) {
+                let start_ts = entry
+                    .get("startTimeStamp")
+                    .and_then(|v| v.as_u64())
+                    .or_else(|| entry.get("startTimeStamp").and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok()))
+                    .unwrap_or(now_ms);
 
-            if let Some(key) = matched_key {
-                if let Some(entry) = timer_map.get(&key) {
-                    println!("get_change_status('{}'): matched timerInfo key = '{}', entry = {}", setting_id, key, entry);
+                let delay_ms = current_timeout;
+                let end_ts = start_ts.saturating_add(delay_ms);
+                let remaining = if end_ts > now_ms { end_ts - now_ms } else { 0u64 };
 
-                    let delay_ms = current_timeout;
+                let new_value = entry
+                    .get("targetTimeout")
+                    .cloned()
+                    .or_else(|| entry.get("newDelayValue").cloned())
+                    .unwrap_or(serde_json::Value::Null);
 
-                    let start_ts = entry
-                        .get("startTimeStamp")
-                        .and_then(|v| v.as_u64())
-                        .or_else(|| entry.get("startTimeStamp").and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok()))
-                        .unwrap_or(now_ms);
+                let delay_at_change = entry
+                    .get("delayTimeOutAtTimeOfChange")
+                    .cloned()
+                    .or_else(|| entry.get("delayTimeoutAtTimeOfChange").cloned())
+                    .unwrap_or(serde_json::Value::Null);
 
-                    let end_ts = start_ts.saturating_add(delay_ms);
-                    let remaining = if end_ts > now_ms { end_ts - now_ms } else { 0u64 };
+                let payload = json!({
+                    "currentTimeout": current_timeout,
+                    "isChanging": true,
+                    "timeRemaining": remaining,
+                    "newValue": new_value,
+                    "delayTimeOutAtTimeOfChange": delay_at_change
+                });
 
-                    let new_value = entry
-                        .get("targetTimeout")
-                        .cloned()
-                        .or_else(|| entry.get("newDelayValue").cloned())
-                        .unwrap_or(serde_json::Value::Null);
-
-                    let delay_at_change = entry
-                        .get("delayTimeOutAtTimeOfChange")
-                        .cloned()
-                        .or_else(|| entry.get("delayTimeoutAtTimeOfChange").cloned())
-                        .unwrap_or(serde_json::Value::Null);
-
-                    let payload = json!({
-                        "currentTimeout": current_timeout,
-                        "isChanging": true,
-                        "timeRemaining": remaining,
-                        "newValue": new_value,
-                        "delayTimeOutAtTimeOfChange": delay_at_change
-                    });
-
-                    println!("get_change_status('{}'): returning = {}", setting_id, payload);
-                    return Ok(payload);
-                }
-            } else {
-                println!("get_change_status('{}'): no matching timerInfo key found (tried '{}')", setting_id, setting_id);
+                println!("get_change_status('{}'): prefs match '{}' -> {:?}", setting_id, key, payload);
+                return Ok(payload);
             }
         } else {
-            println!("get_change_status('{}'): no timerInfo object in prefs", setting_id);
+            println!("get_change_status('{}'): no matching timerInfo key found in prefs", setting_id);
         }
     } else {
         println!("get_change_status('{}'): no timerInfo object in prefs", setting_id);
@@ -1536,6 +1523,48 @@ fn register_page_change_menu_handler(app: &tauri::App) {
     });
 }
 
+fn percent_encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b' ' => out.push_str("%20"),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+#[tauri::command]
+fn show_overlay(app_handle: &tauri::AppHandle, display: &str, process: &str) -> Result<(),String> {
+    if let Some(win) = app_handle.get_window("overlay_window") {
+        let _ = win.show();
+        let _ = win.set_focus();
+        return Ok(());
+    }
+
+    println!("Opening an overlay for app with : display='{}', process='{}'", display, process);
+
+    let url = format!(
+        "overlayWindow.html?displayName={}&processName={}",
+        percent_encode(display),
+        percent_encode(process)
+    );
+
+    if let Err(e) = 
+        tauri::WindowBuilder::new(app_handle, "overlay_window", tauri::WindowUrl::App(url.into()))
+            .title("Overlay")
+            .fullscreen(true)
+            .decorations(false)
+            .always_on_top(true)
+            .visible(true)
+            .build() {
+                eprintln!("flag_app_overlay: failed to create overlay window: {}", e);
+            }
+
+    Ok(())
+}
+
 fn main() {
     const LOCK_ADDR: &str = "127.0.0.1:58859";
     let _lock = match TcpListener::bind(LOCK_ADDR) {
@@ -1558,7 +1587,8 @@ fn main() {
         .menu(build_menu())
         .on_window_event(|event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event.event() {
-                if event.window().label() == "main" {
+                let label  = event.window().label();
+                if label == "main" || label == "overlay_window" {
                     let should_block = read_preferences_for_key(&event.window().app_handle(), "blockSettingsSwitch").unwrap_or(false);
                     if should_block {
                         api.prevent_close();
@@ -1608,9 +1638,9 @@ fn main() {
             prime_for_deletion,
             remove_block_website,
             close_overlay_window,
-            close_confirm_modal,
-            close_dns_modal,
-            show_delay_for_priming_deletion
+            show_delay_for_priming_deletion,
+            close_invoking_window,
+            close_confirmation_dialog
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

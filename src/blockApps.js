@@ -1,7 +1,9 @@
 const { invoke } = window.__TAURI__.tauri;
 const { listen } = window.__TAURI__.event;
+const { WebviewWindow } = window.__TAURI__.window;
 
 const filename = 'blockData.json';
+let confirmDialog;
 
 function getBlockedAppsList() {
     return getBlockData()
@@ -116,16 +118,57 @@ function createDeleteButton(item, index, isAllowedToDelete) {
             if(!item || !item.processName || !item.processName.trim()){
                 return false;
             }
-            const payload = {
-                itemType: "app",
-                name: item.processName
-            }
-            invoke("prime_for_deletion", payload);
+
+            const key = "allowedForUnblockApps-->" + item.processName;
+            invoke("get_change_status", {settingId: key})
+                .then(statusChange => {
+                    if(statusChange.isChanging){
+                        openConfirmationDialog(key);
+                    }
+                    else{
+                        const payload = {
+                            itemType: "app",
+                            name: item.processName
+                        }
+                        invoke("prime_for_deletion", payload);
+                    }
+                });
         }
     };
 
     return button;
 }
+
+
+function openConfirmationDialog(key){
+    if (!key) return;
+
+    if (confirmDialog) {
+        try {
+            confirmDialog.show();
+            confirmDialog.setFocus();
+            confirmDialog.emit('update-confirm-key', { key });
+        } catch (e) {
+            console.warn('openConfirmationDialog: existing dialog focus/emit failed, recreating', e);
+            confirmDialog = null;
+        }
+    }
+
+    if (!confirmDialog) {
+        const url = `confirmDialog.html?key=${encodeURIComponent(key)}`;
+        const config = {
+            url,
+            title: 'Delay Status',
+            width: 450,
+            height: 250,
+            alwaysOnTop: true,
+            focus: true
+        };
+        confirmDialog = new WebviewWindow('confirmDialog', config);
+        confirmDialog.once('tauri://destroyed', () => { confirmDialog = null; });
+    }
+}
+
 
 function initializeListener(){
     listen("block-data-updated").then(() => renderTable());

@@ -13,12 +13,7 @@ function init(){
     initializeEnableProtectiveDns();
     initializeSettingsAndAppProtection();
     initializeSafeSearchProtection();
-    initializeFlagListener();
-    setUpModalCloser();
     listenForRefresh();
-    listenForCloseOfOverlayWindow();
-    listenForDnsModal();
-    listenForPrimeDeletion();
 }
 
 function getPreference(key){
@@ -30,34 +25,42 @@ function saveSharedPreference(key, value = true){
     return invoke("save_preference", args).then(() => console.log("Preference saved"));
 }
 
+function openConfirmationDialog1(key){
+    //invoke("show_confirmation_dialog", {key});
+}
+
 function openConfirmationDialog(key){
-    const config = {
-        url: `confirmDialog.html?key=${encodeURIComponent(key)}`,
-        title: 'Configuration Change',
-        width: 450,
-        height: 250,
-        alwaysOnTop: true,
-        focus: true
-    };
-    confirmDialog = new WebviewWindow('confirmDialog', config);
+    if (!key) return;
+    // if a dialog is already open, bring it to front and send an update event
+    if (confirmDialog) {
+        try {
+            confirmDialog.show();
+            confirmDialog.setFocus();
+            // emit an event to the existing window so it can update (renderer should listen for 'update-confirm-key')
+            confirmDialog.emit('update-confirm-key', { key });
+        } catch (e) {
+            console.warn('openConfirmationDialog: existing dialog focus/emit failed, recreating', e);
+            confirmDialog = null;
+        }
+    }
+
+    if (!confirmDialog) {
+        const url = `confirmDialog.html?key=${encodeURIComponent(key)}`;
+        const config = {
+            url,
+            title: 'Delay Status',
+            width: 450,
+            height: 250,
+            alwaysOnTop: true,
+            focus: true
+        };
+        confirmDialog = new WebviewWindow('confirmDialog', config);
+        confirmDialog.once('tauri://destroyed', () => { confirmDialog = null; });
+    }
 }
 
 function openDnsStrictnessLevelDialog(){
-    if(dnsDialog){
-        return;
-    }
-    const label = `dnsConfirmationModal-${Date.now()}`;
-
-    const config = {
-        url: 'dnsConfirmationModal.html',
-        title: 'Choose DNS strictness level',
-        width: 450,
-        height: 250
-    };
-
-    dnsDialog = new WebviewWindow(label, config);
-    dnsDialog.once('tauri://created', () => console.log("DNS dialog created"));
-    dnsDialog.once('tauri://error', (e) => console.error("Failed to create DNS dialog:", e));
+    invoke("show_dns_confirmation_modal");
 }
 
 async function initializeOverlaySwitch() {
@@ -171,89 +174,9 @@ function isSafeSearchEnabled(){
     return invoke('is_safe_search_enabled');
 }
 
-function showOverlay(displayName = '', processName = '') {
-    if (overlayWindow !== null) return;
-
-    const label = `overlay-${Date.now()}`;
-
-    const url = `overlayWindow.html?displayName=${encodeURIComponent(displayName)}&processName=${encodeURIComponent(processName)}`;
-    overlayWindow = new WebviewWindow(label, {
-        url,
-        title: 'Overlay',
-        fullscreen: true,
-        decorations: false,
-        transparent: false,
-        alwaysOnTop: true,
-        width: 800,
-        height: 600
-    });
-
-    overlayWindow.once('tauri://destroyed', () => overlayWindow = null);
-
-    overlayWindow.once('tauri://created', () => {
-        overlayWindow.emit('appInfo', { displayName, processName });
-        console.log({displayName, processName});
-    });
-}
-
-function closeOverlay() {
-  if (!overlayWindow) return;
-  overlayWindow.close();
-  overlayWindow = null;
-}
-
-function closeDnsModal(){
-    if(!dnsDialog){
-        return;
-    }
-    dnsDialog.close();
-    dnsDialog = null;
-}
-
-function initializeFlagListener(){
-    return listen('flag-app-with-overlay', (event) => {
-        const { displayName, processName } = event.payload ?? {};
-        console.log('flagged process:', displayName, processName);
-        showOverlay(displayName, processName);
-    });
-}
-
-function closeConfirmDialog(){
-    if(confirmDialog){
-        confirmDialog.close();
-        confirmDialog = null;
-    }
-}
-
-function setUpModalCloser(){
-    return listen('close_confirm_modal_prompt', (event) => {
-        console.log("here");
-        closeConfirmDialog();
-    });
-}
-
 function listenForRefresh(){
     return listen('preferences-updated', () => {
-        closeConfirmDialog();
+        invoke('close_confirmation_dialog');
         window.location.reload();
-    });
-}
-
-function listenForCloseOfOverlayWindow(){
-    listen('close_overlay_window_prompted', () => closeOverlay());
-}
-
-function listenForDnsModal(){
-    listen('close_dns_modal_prompt', () => closeDnsModal());
-}
-
-function listenForPrimeDeletion(){
-    listen('show_delay_for_prime_deletion', (event) => {
-        const payload = event?.payload || {};
-        const settingId = payload.settingId;
-
-        if (settingId) {
-            openConfirmationDialog(settingId);
-        }
     });
 }

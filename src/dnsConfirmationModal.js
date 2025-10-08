@@ -25,5 +25,5 @@ confirmBtn.addEventListener('click', async () => {
 });
 
 function closeModal(){
-    invoke('close_dns_modal');
+    invoke('close_invoking_window');
 }

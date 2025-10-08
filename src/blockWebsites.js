@@ -3,8 +3,9 @@ const { listen } = window.__TAURI__.event;
 const { WebviewWindow } = window.__TAURI__.window;
 const HOSTS_FILE = 'C:\\Windows\\System32\\drivers\\etc\\hosts';
 
-let list;
 let confirmDialog;
+
+let list;
 const setOfEntries = new Set();
 
 function init(){
@@ -135,13 +136,42 @@ function createDeleteButton(item, index, isAllowedToDelete) {
     return button;
 }
 
+
+function sleep(ms) {
+    return new Promise((res) => setTimeout(res, ms));
+}
+
+async function fetchBlockDataWithRetry(attempts = 5, baseDelay = 100) {
+    for (let i = 0; i < attempts; i++) {
+        try {
+            const blockData = await invoke('get_block_data');
+            // basic validation: must be an object and contain blockedWebsites array (could legitimately be empty)
+            if (
+                blockData &&
+                typeof blockData === 'object' &&
+                (Array.isArray(blockData.blockedWebsites) || Object.prototype.hasOwnProperty.call(blockData, 'blockedWebsites'))
+            ) {
+                return blockData;
+            }
+        } catch (err) {
+            console.warn('fetchBlockDataWithRetry: invoke failed, attempt', i + 1, err);
+        }
+        await sleep(baseDelay * Math.pow(2, i));
+    }
+    
+    return invoke('get_block_data').catch((e) => {
+        console.error('fetchBlockDataWithRetry: final attempt failed', e);
+        return null;
+    });
+}
+
 async function renderTable() {
     const tbody = document.querySelector('#data-table tbody');
     tbody.innerHTML = '';
 
-    return invoke('get_block_data')
-        .then(blockData => {
-            const blockedWebsites = new Set(Array.from(blockData?.blockedWebsites || []));
+    try{
+        const blockData =  await fetchBlockDataWithRetry(5, 100);
+        const blockedWebsites = new Set(Array.from(blockData?.blockedWebsites || []));
             if (!blockedWebsites || blockedWebsites.length === 0) {
                 tbody.appendChild(createEmptyRow("No websites blocked yet."));
             }
@@ -158,7 +188,10 @@ async function renderTable() {
                 });
                 list = Array.from(blockedWebsites);
             }
-        });
+    } catch(error){
+        console.log(error);
+        tbody.appendChild(createEmptyRow("No websites blocked yet."));
+    }
 }
 
 function getButtonTextAndColour(isAllowedToDelete){
@@ -245,13 +278,30 @@ function listenForPrimeDeletion(){
 }
 
 function openConfirmationDialog(key){
-    const config = {
-        url: `confirmDialog.html?key=${encodeURIComponent(key)}`,
-        title: 'Delay Status',
-        width: 450,
-        height: 250,
-        alwaysOnTop: true,
-        focus: true
-    };
-    confirmDialog = new WebviewWindow('confirmDialog', config);
+    if (!key) return;
+
+    if (confirmDialog) {
+        try {
+            confirmDialog.show();
+            confirmDialog.setFocus();
+            confirmDialog.emit('update-confirm-key', { key });
+        } catch (e) {
+            console.warn('openConfirmationDialog: existing dialog focus/emit failed, recreating', e);
+            confirmDialog = null;
+        }
+    }
+
+    if (!confirmDialog) {
+        const url = `confirmDialog.html?key=${encodeURIComponent(key)}`;
+        const config = {
+            url,
+            title: 'Delay Status',
+            width: 450,
+            height: 250,
+            alwaysOnTop: true,
+            focus: true
+        };
+        confirmDialog = new WebviewWindow('confirmDialog', config);
+        confirmDialog.once('tauri://destroyed', () => { confirmDialog = null; });
+    }
 }

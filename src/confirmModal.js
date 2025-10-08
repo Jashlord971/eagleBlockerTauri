@@ -49,7 +49,7 @@ async function init(){
 init();
 
 function closeModal(){
-    invoke('close_confirm_modal');
+    invoke('close_invoking_window');
 }
 
 function showProgressBar(timeRemaining, delayTimeOutAtTimeOfChange){
@@ -62,8 +62,8 @@ function showProgressBar(timeRemaining, delayTimeOutAtTimeOfChange){
     const cancelBtnForProgressBar = document.getElementById('cancelBtnForProgressBar');
     cancelBtnForProgressBar.addEventListener('click', () => {
         confirmBtn.disabled = true;
-        closeModal();
-        invoke('cancel_countdown_timer', {settingId});
+        invoke('cancel_countdown_timer', {settingId})
+            .then(() => closeModal());
     });
 
     const endTime = Date.now() + timeRemaining;
