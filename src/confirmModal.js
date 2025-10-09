@@ -18,7 +18,8 @@ async function init(){
             if(!statusChange.isChanging){
                 return;
             }
-            showProgressBar(statusChange.timeRemaining, statusChange.delayTimeOutAtTimeOfChange);
+            const delayTime = statusChange.delayTimeOutAtTimeOfChange || statusChange.currentTimeout;
+            showProgressBar(statusChange.timeRemaining, delayTime);
         });
 
 
@@ -52,40 +53,56 @@ function closeModal(){
     invoke('close_invoking_window');
 }
 
+// ...existing code...
 function showProgressBar(timeRemaining, delayTimeOutAtTimeOfChange){
     const confirmDialog = document.getElementById("confirm-modal");
     const progressContainer = document.getElementById('progressContainer');
+    const timeEl = document.getElementById('timeRemaining');
+    const barEl = document.getElementById('progressBar');
+    const cancelBtnForProgressBar = document.getElementById('cancelBtnForProgressBar');
+    const confirmBtn = document.getElementById('confirmBtn');
+
+    if (!confirmDialog || !progressContainer || !timeEl || !barEl) {
+        console.warn('showProgressBar: missing DOM elements');
+        return;
+    }
 
     confirmDialog.style.display = 'none';
     progressContainer.style.display = 'block';
 
-    const cancelBtnForProgressBar = document.getElementById('cancelBtnForProgressBar');
-    cancelBtnForProgressBar.addEventListener('click', () => {
-        confirmBtn.disabled = true;
-        invoke('cancel_countdown_timer', {settingId})
-            .then(() => closeModal());
-    });
+    // Coerce to numbers and guard against zero/NaN
+    const total = Number(delayTimeOutAtTimeOfChange) || Number(timeRemaining) || 1;
+    const endTime = Date.now() + (Number(timeRemaining) || 0);
 
-    const endTime = Date.now() + timeRemaining;
+    if (cancelBtnForProgressBar) {
+        cancelBtnForProgressBar.addEventListener('click', () => {
+            if (confirmBtn) confirmBtn.disabled = true;
+            invoke('cancel_countdown_timer', { settingId }).then(() => closeModal());
+        }, { once: true });
+    }
+
+    let interval = null;
 
     const updateProgress = () => {
         const remaining = Math.max(endTime - Date.now(), 0);
-        const percent = 100 - Math.floor((remaining / delayTimeOutAtTimeOfChange) * 100);
 
-        document.getElementById('timeRemaining').innerText = `${Math.ceil(remaining / 1000)}s`;
-        document.getElementById('progressBar').style.width = `${percent}%`;
+        const percentagePassed = (remaining / delayTimeOutAtTimeOfChange);
+        console.log(percentagePassed);
+        const percent = 100 - Math.floor(percentagePassed * 100);
+
+        timeEl.innerText = `${Math.ceil(remaining / 1000)}s`;
+        barEl.style.width = `${percent}%`;
 
         if (remaining <= 0) {
-            clearInterval(interval);
+            if (interval) clearInterval(interval);
             progressContainer.style.display = 'none';
             confirmDialog.style.display = 'block';
-
-            const confirmBtn = document.getElementById('confirmBtn');
-            confirmBtn.disabled = true;
+            if (confirmBtn) confirmBtn.disabled = true;
             closeModal();
         }
     };
 
     updateProgress();
-    const interval = setInterval(updateProgress, 1000);
+    interval = setInterval(updateProgress, 1000);
 }
+// ...existing code...

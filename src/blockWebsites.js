@@ -6,7 +6,6 @@ const HOSTS_FILE = 'C:\\Windows\\System32\\drivers\\etc\\hosts';
 let confirmDialog;
 
 let list;
-const setOfEntries = new Set();
 
 function init(){
     if(!window){
@@ -41,7 +40,6 @@ function init(){
                 .then(success => {
                     if (success) {
                         window.location.reload();
-                        modal.style.display = 'none';
                     }
                 })
                 .catch(error => {
@@ -50,7 +48,7 @@ function init(){
                 });
         });
 
-        await renderTable();
+        void renderTable();
     });
 
     window.removeItem = (index) => removeWebsite(index);
@@ -62,15 +60,12 @@ function removeWebsite(index){
     }
     const site = list[index];
     invoke('remove_block_website', {site})
-        .then(() => {
-            window.location.reload();
-            setOfEntries.delete(item);
-        })
+        .then(() => window.location.reload())
         .catch(error => console.log(error));
 }
 
 function initializeListener(){
-    listen("block-data-updated").then(() => renderTable());
+    listen("block-data-updated", () => renderTable());
 }
 
 init();
@@ -78,7 +73,7 @@ init();
 function createEmptyRow(message) {
     const row = document.createElement('tr');
     const cell = document.createElement('td');
-    cell.colSpan = 2;
+    cell.colSpan = 3;
     cell.textContent = message;
     row.appendChild(cell);
     return row;
@@ -86,6 +81,21 @@ function createEmptyRow(message) {
 
 function createDataRow(item, index, isAllowedToDelete) {
     const row = document.createElement('tr');
+    const iconCell = document.createElement('td');
+    const icon = document.createElement('span');
+    icon.textContent = '✅';
+    icon.setAttribute('data-timr', '1');
+
+    if (!isAllowedToDelete) {
+        const key = "allowedForUnblockWebsites-->" + item;
+        invoke("get_change_status", { settingId: key })
+            .then(statusChange => {
+                if (statusChange && statusChange.isChanging) {
+                    icon.textContent = '⏱️';
+                }
+            });
+    }
+    iconCell.appendChild(icon);
 
     const nameCell = document.createElement('td');
     nameCell.textContent = typeof item === 'string' ? item : item.displayName;
@@ -94,6 +104,7 @@ function createDataRow(item, index, isAllowedToDelete) {
     const deleteButton = createDeleteButton(item, index, isAllowedToDelete);
     deleteCell.appendChild(deleteButton);
 
+    row.appendChild(iconCell);
     row.appendChild(nameCell);
     row.appendChild(deleteCell);
 
@@ -127,7 +138,11 @@ function createDeleteButton(item, index, isAllowedToDelete) {
                             itemType: "website",
                             name: item
                         }
-                        invoke("prime_for_deletion", payload);
+                        invoke("prime_for_deletion", payload).then(() => {
+                            const row = button.closest('tr');
+                            const timr = row?.querySelector('[data-timr]');
+                            if (timr) timr.textContent = '⏱️';
+                        });
                     }
                 });
         }
@@ -136,62 +151,26 @@ function createDeleteButton(item, index, isAllowedToDelete) {
     return button;
 }
 
-
-function sleep(ms) {
-    return new Promise((res) => setTimeout(res, ms));
-}
-
-async function fetchBlockDataWithRetry(attempts = 5, baseDelay = 100) {
-    for (let i = 0; i < attempts; i++) {
-        try {
-            const blockData = await invoke('get_block_data');
-            // basic validation: must be an object and contain blockedWebsites array (could legitimately be empty)
-            if (
-                blockData &&
-                typeof blockData === 'object' &&
-                (Array.isArray(blockData.blockedWebsites) || Object.prototype.hasOwnProperty.call(blockData, 'blockedWebsites'))
-            ) {
-                return blockData;
-            }
-        } catch (err) {
-            console.warn('fetchBlockDataWithRetry: invoke failed, attempt', i + 1, err);
-        }
-        await sleep(baseDelay * Math.pow(2, i));
-    }
-    
-    return invoke('get_block_data').catch((e) => {
-        console.error('fetchBlockDataWithRetry: final attempt failed', e);
-        return null;
-    });
-}
-
 async function renderTable() {
     const tbody = document.querySelector('#data-table tbody');
     tbody.innerHTML = '';
-
-    try{
-        const blockData =  await fetchBlockDataWithRetry(5, 100);
-        const blockedWebsites = new Set(Array.from(blockData?.blockedWebsites || []));
+    
+    return invoke('get_block_data_for_block_websites')
+        .then(blockData => {
+            const blockedWebsites = new Set(Array.from(blockData?.blockedWebsites || []));
             if (!blockedWebsites || blockedWebsites.length === 0) {
                 tbody.appendChild(createEmptyRow("No websites blocked yet."));
             }
             else{
                 const allowedWebsitesForDeletions = new Set(Array.from(blockData.allowedForUnblockWebsites ?? []));
                 Array.from(blockedWebsites).forEach((item, index) => {
-                    if(setOfEntries.has(item)){
-                        return;
-                    }
                     const isAllowedToDelete = allowedWebsitesForDeletions.has(item);
                     const row = createDataRow(item, index, isAllowedToDelete);
                     tbody.appendChild(row);
-                    setOfEntries.add(item);
                 });
                 list = Array.from(blockedWebsites);
             }
-    } catch(error){
-        console.log(error);
-        tbody.appendChild(createEmptyRow("No websites blocked yet."));
-    }
+        });
 }
 
 function getButtonTextAndColour(isAllowedToDelete){

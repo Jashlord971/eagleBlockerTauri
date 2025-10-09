@@ -60,7 +60,6 @@ function processBlockedAppsAndRenderTable(list) {
     const tbody = document.querySelector('#data-table tbody');
     if (!tbody) return;
 
-    // clear rows
     if (tbody.replaceChildren) tbody.replaceChildren();
     else tbody.innerHTML = '';
 
@@ -69,7 +68,18 @@ function processBlockedAppsAndRenderTable(list) {
         return;
     }
 
-    (list || []).forEach((item, index) => {
+     const uniqueList = Array.from(
+        new Map(
+            (list || []).map(item => [item?.processName?.toLowerCase()?.trim(), item])
+        ).values()
+    );
+
+    if (uniqueList.length === 0) {
+        tbody.appendChild(createEmptyRow('No apps blocked yet.'));
+        return;
+    }
+
+    uniqueList.forEach(async (item, index) => {
         const row = document.createElement('tr');
 
         const nameCell = document.createElement('td');
@@ -79,8 +89,24 @@ function processBlockedAppsAndRenderTable(list) {
         const deleteButton = createDeleteButton(item, index, item?.isAllowedForDelete);
         deleteCell.appendChild(deleteButton);
 
+        const iconCell = document.createElement('td');
+        const icon = document.createElement('span');
+        icon.textContent = '✅';
+
+        if(!item?.isAllowedForDelete){
+            const key = "allowedForUnblockApps-->" + item.processName;
+            const changeStatus = await invoke("get_change_status", {settingId: key});
+            if(changeStatus.isChanging){
+                icon.textContent = '⏱️';
+            }
+        }
+
+        iconCell.appendChild(icon);
+        row.appendChild(iconCell);
+
         row.appendChild(nameCell);
         row.appendChild(deleteCell);
+
         tbody.appendChild(row);
     });
 }
@@ -130,7 +156,8 @@ function createDeleteButton(item, index, isAllowedToDelete) {
                             itemType: "app",
                             name: item.processName
                         }
-                        invoke("prime_for_deletion", payload);
+                        invoke("prime_for_deletion", payload)
+                            .then(() => window.location.reload());
                     }
                 });
         }

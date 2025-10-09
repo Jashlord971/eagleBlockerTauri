@@ -12,7 +12,6 @@
             padding: 0;
         }
 
-        /* Menu Bar Styles */
         .menu-bar {
             background-color: #003380;
             padding: 0;
@@ -50,13 +49,42 @@
         }
 
         .pref-row {
-            display: flex;
-            justify-content: space-between;
+            display: grid;
+            grid-template-columns: 1fr 28px 28px 60px;
             align-items: center;
+            gap: 12px;
             background-color: rgba(255, 255, 255, 0.1);
             padding: 12px 20px;
             margin-bottom: 10px;
             border-radius: 10px;
+        }
+
+        .label-text {
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .timer-icon,
+        .info-icon {
+            width: 24px;
+            height: 24px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+            cursor: pointer;
+        }
+
+        .timer-icon {
+            color: #FFA500;
+        }
+
+        .info-icon {
+            color: #FFD700;
+        }
+
+        .timer-icon.is-hidden {
+            visibility: hidden;
         }
 
         .switch {
@@ -64,6 +92,7 @@
             display: inline-block;
             width: 50px;
             height: 24px;
+            justify-self: end;
         }
 
         .switch input {
@@ -104,29 +133,6 @@
             transform: translateX(26px);
         }
 
-        .pref-row {
-            display: grid;
-            grid-template-columns: 1fr auto auto;
-            align-items: center;
-            gap: 12px;
-            background-color: rgba(255, 255, 255, 0.1);
-            padding: 12px 20px;
-            margin-bottom: 10px;
-            border-radius: 10px;
-        }
-
-        .label-text {
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
-
-        .info-icon {
-            cursor: pointer;
-            font-size: 18px;
-            color: #FFD700;
-        }
-
         .tooltip-box {
             position: absolute;
             background-color: #222;
@@ -146,6 +152,7 @@
 
     <div class="pref-row">
         <div class="label-text">Enable Overlay Over Restricted Content</div>
+        <div class="timer-icon is-hidden" id="timer-overlayRestrictedContent" data-description="Is undergoing a delay change. Tap switch to see details.">⏱️</div>
         <div class="info-icon" data-description="This shows a fullscreen overlay when restricted apps are opened.">💡</div>
         <label class="switch">
             <input type="checkbox" id="overlayRestrictedContent">
@@ -155,6 +162,7 @@
 
     <div class="pref-row">
         <div class="label-text">Enable Protective DNS</div>
+        <div class="timer-icon is-hidden" id="timer-enableProtectiveDNS" data-description="Is undergoing a delay change. Tap switch to see details.">⏱️</div>
         <div class="info-icon" data-description="Protects your searches by filtering adult or harmful content.">💡</div>
         <label class="switch">
             <input type="checkbox" id="enableProtectiveDNS">
@@ -164,6 +172,7 @@
 
     <div class="pref-row">
         <div class="label-text">Settings and App Protection</div>
+        <div class="timer-icon is-hidden" id="timer-blockSettingsSwitch" data-description="Is undergoing a delay change. Tap switch to see details.">⏱️</div>
         <div class="info-icon" data-description="Allows the app to block sensitive system settings when enabled. This includes protections against having the app installed">💡</div>
         <label class="switch">
             <input type="checkbox" id="blockSettingsSwitch">
@@ -173,6 +182,7 @@
 
     <div class="pref-row">
         <div class="label-text">Enforce Safe Search</div>
+        <div class="timer-icon is-hidden" id="timer-enforceSafeSearch" data-description="Is undergoing a delay change. Tap switch to see details.">⏱️</div>
         <div class="info-icon" data-description="This enforces safe search on google and bing if your dns settings are not strict">💡</div>
         <label class="switch">
             <input type="checkbox" id="enforceSafeSearch">

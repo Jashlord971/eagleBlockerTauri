@@ -6,7 +6,7 @@
     "withGlobalTauri": true
   },
   "package": {
-    "productName": "Eagle Blocker",
+    "productName": "eagleblocker",
     "version": "0.1.0"
   },
   "tauri": {

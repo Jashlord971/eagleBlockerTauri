@@ -6,6 +6,63 @@ let overlayWindow = null;
 let confirmDialog = null;
 let dnsDialog = null;
 
+let tooltipsInitialized = false;
+
+const KEYS = [
+    'overlayRestrictedContent',
+    "enableProtectiveDNS",
+    'blockSettingsSwitch',
+    "enforceSafeSearch"
+];
+
+function initTooltips() {
+    if (tooltipsInitialized) {
+        return;
+    }
+    tooltipsInitialized = true;
+
+    let tip = document.querySelector('.tooltip-box');
+    if (!tip) {
+        tip = document.createElement('div');
+        tip.className = 'tooltip-box';
+        document.body.appendChild(tip);
+    }
+
+    const show = (el, e) => {
+        const text = el.getAttribute('data-description');
+        if (!text) return;
+        tip.textContent = text;
+        tip.style.display = 'block';
+        position(e);
+    };
+
+    const hide = () => {
+        tip.style.display = 'none';
+    };
+
+    const position = (e) => {
+        const pad = 12;
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+        const rect = tip.getBoundingClientRect();
+        let x = e.clientX + pad;
+        let y = e.clientY + pad;
+        if (x + rect.width > vw) x = Math.max(0, vw - rect.width - pad);
+        if (y + rect.height > vh) y = Math.max(0, vh - rect.height - pad);
+        tip.style.left = `${x + window.scrollX}px`;
+        tip.style.top = `${y + window.scrollY}px`;
+        tip.style.position = 'absolute';
+    };
+
+    const bind = (el) => {
+        el.addEventListener('mouseenter', (e) => show(el, e));
+        el.addEventListener('mousemove', position);
+        el.addEventListener('mouseleave', hide);
+    };
+
+    document.querySelectorAll('.info-icon, .timer-icon').forEach(bind);
+}
+
 window.addEventListener('DOMContentLoaded', () => init());
 
 function init(){
@@ -14,6 +71,20 @@ function init(){
     initializeSettingsAndAppProtection();
     initializeSafeSearchProtection();
     listenForRefresh();
+    listenForTimerUpdate();
+    initTooltips();
+
+    Array.from(KEYS).map(key => showTimerIcon(key));
+}
+
+function showTimerIcon(key){
+    return invoke('get_change_status', {settingId: key})
+        .then(status => {
+            if(status && status.isChanging){
+                const timerIconKey = "timer-" + key;
+                showElement(timerIconKey);
+            }
+        });
 }
 
 function getPreference(key){
@@ -25,18 +96,13 @@ function saveSharedPreference(key, value = true){
     return invoke("save_preference", args).then(() => console.log("Preference saved"));
 }
 
-function openConfirmationDialog1(key){
-    //invoke("show_confirmation_dialog", {key});
-}
-
 function openConfirmationDialog(key){
     if (!key) return;
-    // if a dialog is already open, bring it to front and send an update event
+
     if (confirmDialog) {
         try {
             confirmDialog.show();
             confirmDialog.setFocus();
-            // emit an event to the existing window so it can update (renderer should listen for 'update-confirm-key')
             confirmDialog.emit('update-confirm-key', { key });
         } catch (e) {
             console.warn('openConfirmationDialog: existing dialog focus/emit failed, recreating', e);
@@ -83,6 +149,13 @@ async function initializeOverlaySwitch() {
             saveSharedPreference(key);
         } 
     });
+}
+
+function showElement(id) {
+    const el = document.getElementById(id);
+    if (el) {
+        el.classList.remove('is-hidden');
+    }
 }
 
 async function isProtectiveDnsOn(key){
@@ -179,4 +252,8 @@ function listenForRefresh(){
         invoke('close_confirmation_dialog');
         window.location.reload();
     });
+}
+
+function listenForTimerUpdate(){
+    return listen("timer-updated", () => window.location.reload());
 }
