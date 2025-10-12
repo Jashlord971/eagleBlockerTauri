@@ -31,6 +31,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 #[cfg(windows)]
+
+mod browser_detector;
+use browser_detector::BrowserDetector;
+static BROWSER_DETECTOR: Lazy<BrowserDetector> = Lazy::new(|| BrowserDetector::new());
+
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const DELAY_TIMEOUT_KEY: &str = "delayTimeOutAtTimeOfChange";
 
@@ -520,12 +525,15 @@ fn process_matches_running(proc_name: &str, running: &std::collections::HashSet<
     })
 }
 
+fn is_embedded_webview(process_name: &str) -> bool {
+    let p = process_name.to_lowercase();
+    p.contains("msedgewebview2") || p.contains("webview2") || p.contains("bravecrashhandler")
+}
+
 #[tauri::command]
 fn turn_on_settings_and_app_protection(app_handle: tauri::AppHandle) -> Result<bool, String> {
-    println!("turn_on_settings_and_app_protection: starting");
     let mut guard = PROTECTION_HANDLE.lock().map_err(|e| e.to_string())?;
     if guard.is_some() {
-        println!("turn_on_settings_and_app_protection: already running");
         return Ok(true);
     }
 
@@ -556,6 +564,7 @@ fn turn_on_settings_and_app_protection(app_handle: tauri::AppHandle) -> Result<b
             }
 
             let is_overlay_protection_on = read_preferences_for_key(&app_clone, "overlayRestrictedContent").unwrap_or(false);
+            let is_dns_protection_on = read_preferences_for_key(&app_clone, "enableProtectiveDNS").unwrap_or(false);
             let enabled = is_settings_protection_on && is_overlay_protection_on;
 
             if enabled {
@@ -584,6 +593,19 @@ fn turn_on_settings_and_app_protection(app_handle: tauri::AppHandle) -> Result<b
                             }
                         }
 
+                        if has_flagged == false && is_dns_protection_on {
+                            if BROWSER_DETECTOR.is_tor_proxy_running_enhanced() {
+                                for process_name in running.iter() {
+                                    if BROWSER_DETECTOR.is_browser_application(process_name) && !is_embedded_webview(process_name) {
+                                        let _ = show_overlay(&app_clone, process_name, process_name);
+                                        has_flagged = true;
+                                        println!("Found a registered browser running while the tor connection is on. Flagged!");
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
                         if has_flagged == false {
                             close_overlay_window(app_clone.clone());
                         }
@@ -602,6 +624,7 @@ fn turn_on_settings_and_app_protection(app_handle: tauri::AppHandle) -> Result<b
     Ok(true)
 }
 
+// ...existing code...
 fn perform_sync_recovery(app_handle: &tauri::AppHandle) -> Result<(), String> {
     println!("perform_sync_recovery: starting sync/recovery check");
 
@@ -622,6 +645,7 @@ fn perform_sync_recovery(app_handle: &tauri::AppHandle) -> Result<(), String> {
         restore_default_preferences(app_handle)?;
     }
 
+    // Refresh caches from disk if currently empty
     if let Ok(mut guard) = BLOCK_DATA_CACHE.lock() {
         if guard.is_none() && block_path.exists() {
             println!("perform_sync_recovery: refreshing empty cache");
@@ -636,6 +660,41 @@ fn perform_sync_recovery(app_handle: &tauri::AppHandle) -> Result<(), String> {
             println!("perform_sync_recovery: refreshing empty cache");
             if let Ok(map) = read_json_map(&prefs_path) {
                 *guard = Some(map);
+            }
+        }
+    }
+
+    // If cache exists and differs from disk, prefer cache and overwrite the stored file
+    if let Ok(guard) = BLOCK_DATA_CACHE.lock() {
+        if let Some(cached_map) = guard.as_ref() {
+            match read_json_map(&block_path) {
+                Ok(stored_map) => {
+                    if &stored_map != cached_map {
+                        println!("perform_sync_recovery: blockData.json differs from cache — overwriting file with cached data");
+                        write_json_map(&block_path, cached_map)?;
+                    }
+                }
+                Err(_) => {
+                    println!("perform_sync_recovery: failed to read blockData.json; writing cached data to disk");
+                    write_json_map(&block_path, cached_map)?;
+                }
+            }
+        }
+    }
+
+    if let Ok(guard) = SAVED_PREFERENCES_CACHE.lock() {
+        if let Some(cached_prefs) = guard.as_ref() {
+            match read_json_map(&prefs_path) {
+                Ok(stored_prefs) => {
+                    if &stored_prefs != cached_prefs {
+                        println!("perform_sync_recovery: savedPreferences.json differs from cache — overwriting file with cached preferences");
+                        write_json_map(&prefs_path, cached_prefs)?;
+                    }
+                }
+                Err(_) => {
+                    println!("perform_sync_recovery: failed to read savedPreferences.json; writing cached preferences to disk");
+                    write_json_map(&prefs_path, cached_prefs)?;
+                }
             }
         }
     }
