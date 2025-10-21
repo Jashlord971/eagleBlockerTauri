@@ -3,7 +3,6 @@ use std::net::{TcpStream, SocketAddr};
 use std::time::Duration;
 use std::path::Path;
 use winreg::{RegKey, enums::*};
-use std::process::Command;
 
 pub struct BrowserDetector {
     known_browsers: HashSet<String>,
@@ -68,11 +67,6 @@ impl BrowserDetector {
             .any(|browser| lowercase.contains(browser))
     }
 
-    fn is_tor_browser(&self, process_name: &str) -> bool {
-        let lowercase = process_name.to_lowercase();
-        self.tor_browsers.iter().any(|tor_browser| lowercase.contains(tor_browser))
-    }
-
     fn is_tor_proxy_running(&self) -> bool {
         let tor_addresses = [
             "127.0.0.1:9050",
@@ -87,9 +81,7 @@ impl BrowserDetector {
                         println!("✓ SUCCESS: Detected Tor proxy on {}", addr_str);
                         return true;
                     }
-                    Err(e) => {
-                        //println!("✗ FAILED: Connection to {} failed: {}", addr_str, e);
-                    }
+                    Err(_e) => {}
                 }
             }
         }
@@ -103,24 +95,6 @@ impl BrowserDetector {
         self.scan_ports_with_powershell(&mut tor_related_ports);
         
         tor_related_ports
-    }
-    
-    fn is_potentially_tor_port(&self, netstat_line: &str) -> bool {
-        let tor_indicators = [
-            ":9050", 
-            ":9051", 
-            ":9150", 
-            ":9151",
-            ":8118", 
-            ":8080", 
-            ":8888",
-            ":9001", 
-            ":9030",
-            ":443", 
-            ":80"
-        ];
-        
-        tor_indicators.iter().any(|indicator| netstat_line.contains(indicator))
     }
 
     fn is_known_false_positive(&self, line: &str) -> bool {
@@ -148,29 +122,53 @@ impl BrowserDetector {
         false_positives.iter().any(|fp| line_lower.contains(fp))
     }
 
+    fn run_powershell_hidden_args(args: &[&str]) -> Result<std::process::Output, String> {
+        for exe in ["pwsh.exe", "powershell.exe"] {
+            match crate::run_hidden_output(&exe, args) {
+                Ok(out) => return Ok(out),
+                Err(e) => {
+                    let el = e.to_lowercase();
+                    if el.contains("not found") || el.contains("cannot find") {
+                        continue;
+                    }
+                    return Err(format!("failed to run {}: {}", exe, e));
+                }
+            }
+        }
+        Err("no PowerShell found (pwsh.exe or powershell.exe)".into())
+    }
+
     fn scan_ports_with_powershell(&self, tor_ports: &mut Vec<(String, String)>) {
         let ps_cmd = r#"
-            Get-NetTCPConnection | Where-Object {$_.State -eq "Listen"} | 
+            Get-NetTCPConnection | Where-Object {$_.State -eq "Listen"} |
             ForEach-Object {
                 $proc = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue
                 "$($_.LocalAddress):$($_.LocalPort) - $($proc.ProcessName)"
             }
         "#;
-        
-        match Command::new("powershell")
-            .args(&["-Command", ps_cmd])
-            .output() {
+
+        let args = [
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy", "Bypass",
+            "-WindowStyle", "Hidden",
+            "-Command", ps_cmd,
+        ];
+
+        match Self::run_powershell_hidden_args(&args) {
             Ok(output) => {
                 let output_str = String::from_utf8_lossy(&output.stdout);
-                
                 for line in output_str.lines() {
-                    if !line.trim().is_empty() && !self.is_known_false_positive(line) && self.is_tor_related_line(line) {
+                    if !line.trim().is_empty()
+                        && !self.is_known_false_positive(line)
+                        && self.is_tor_related_line(line)
+                    {
                         tor_ports.push((line.to_string(), "PowerShell Tor Detection".to_string()));
                     }
                 }
             }
             Err(e) => {
-                println!("Failed to run PowerShell: {}", e);
+                println!("Failed to run PowerShell hidden: {}", e);
             }
         }
     }
@@ -290,20 +288,6 @@ impl BrowserDetector {
         }
         
         browsers
-    }
-
-    fn check_tor_processes(&self, running_processes: &[String]) -> bool {
-        let tor_processes = [
-            "tor.exe", 
-            "obfs4proxy.exe", "snowflake-client.exe", 
-            "meek-client.exe", "torbrowser.exe"
-        ];
-        
-        tor_processes.iter().any(|tor_proc| {
-            running_processes.iter().any(|running| 
-                running.to_lowercase().contains(&tor_proc.to_lowercase())
-            )
-        })
     }
 }
 

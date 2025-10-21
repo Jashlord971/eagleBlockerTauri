@@ -12,7 +12,6 @@ use std::str;
 use regex::Regex;
 use std::io::Write;
 use std::env;
-use once_cell::sync::Lazy;
 use std::sync::{Mutex, Arc, atomic::{AtomicBool, Ordering}};
 use std::thread;
 use std::time::Duration;
@@ -26,20 +25,29 @@ use winreg::RegKey;
 use std::collections::HashMap;
 use std::fs::File;
 use std::time::{SystemTime, UNIX_EPOCH};
+use once_cell::sync::Lazy;
 
-// Windows-only: creation flag to prevent flashing console windows for child processes
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+
 #[cfg(windows)]
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+#[cfg(windows)]
+use windows::Win32::System::SystemInformation::GetTickCount64;
 
 mod browser_detector;
 use browser_detector::BrowserDetector;
 static BROWSER_DETECTOR: Lazy<BrowserDetector> = Lazy::new(|| BrowserDetector::new());
-
+static OWN_UNINSTALLERS: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
+static OVERLAY_OPEN: Lazy<std::sync::atomic::AtomicBool> = Lazy::new(|| std::sync::atomic::AtomicBool::new(false));
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const DELAY_TIMEOUT_KEY: &str = "delayTimeOutAtTimeOfChange";
 
-fn run_hidden_output(program: &str, args: &[&str]) -> Result<std::process::Output, String> {
+static DNS_SAFE_CACHE: Lazy<Mutex<Option<(bool, std::time::Instant)>>> =
+    Lazy::new(|| Mutex::new(None));
+const DNS_SAFE_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
+pub(crate) fn run_hidden_output(program: &str, args: &[&str]) -> Result<std::process::Output, String> {
     let mut cmd = Command::new(program);
     cmd.args(args);
     #[cfg(windows)]
@@ -79,6 +87,7 @@ const PROTECTED_SYSTEM_APPS : [(&str, &[&str]); 3] = [
 const TASK_NAME: &str = "Eagle Task Schedule";
 const HOSTS_PATH: &str = r"C:\Windows\System32\drivers\etc\hosts";
 const DELAY_SETTINGS: &str = "delayTimeOut";
+const UNINSTALL_OVERLAY_DISPLAY: &str = "Uninstaller";
 
 fn get_preferences_path(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
     let mut path = app_data_dir(&app_handle.config()).ok_or("No app data dir")?;
@@ -278,15 +287,37 @@ fn save_block_data(data: Map<String, Value>, app_handle: tauri::AppHandle) -> Re
 
 #[tauri::command]
 fn is_dns_made_safe() -> Result<bool, String> {
+    is_dns_made_safe_cached()
+}
+
+fn dns_cache_set(value: bool) {
+    if let Ok(mut g) = DNS_SAFE_CACHE.lock() {
+        *g = Some((value, std::time::Instant::now()));
+    }
+}
+
+fn is_dns_made_safe_cached() -> Result<bool, String> {
+    let now = std::time::Instant::now();
+    if let Ok(mut g) = DNS_SAFE_CACHE.lock() {
+        if let Some((val, ts)) = g.as_ref().copied() {
+            if now.duration_since(ts) < DNS_SAFE_TTL {
+                return Ok(val);
+            }
+        }
+        let interface_name = get_active_interface_name()?;
+        let fresh = is_safe_dns(&interface_name)?;
+        *g = Some((fresh, now));
+        return Ok(fresh);
+    }
     let interface_name = get_active_interface_name()?;
     is_safe_dns(&interface_name)
 }
 
 #[tauri::command]
-fn turn_on_dns(is_strict: bool, app_handle: tauri::AppHandle) -> Result<(), String> {
+async fn turn_on_dns(is_strict: bool, app_handle: tauri::AppHandle) -> Result<(), String> {
     let interface_name = get_active_interface_name()?;
 
-    configure_safe_dns(&interface_name, is_strict).map_err(|e| {
+    configure_safe_dns(&interface_name, is_strict).await.map_err(|e| {
         eprintln!("turn_on_dns: configure_safe_dns failed: {}", e);
         let elow = e.to_lowercase();
         if elow.contains("elevation canceled") || elow.contains("canceled by the user") || elow.contains("operation was canceled") {
@@ -296,11 +327,19 @@ fn turn_on_dns(is_strict: bool, app_handle: tauri::AppHandle) -> Result<(), Stri
         }
     })?;
 
+    dns_cache_set(true);
+
     save_preference(
         "enableProtectiveDNS".to_string(),
         serde_json::Value::Bool(true),
-        app_handle,
+        app_handle.clone(),
     )?;
+
+    let _ = tauri::Manager::emit_all(
+        &app_handle,
+        "main-config-updated",
+        serde_json::json!({}),
+    );
 
     Ok(())
 }
@@ -351,35 +390,52 @@ fn is_safe_dns(interface_name: &str) -> Result<bool, String> {
     Ok(has_strict_dns || has_lenient_dns)
 }
 
-fn run_elevated_command(cmd: &str) -> Result<(), String> {
-    let ps = format!(
-        "Start-Process -FilePath 'cmd.exe' -ArgumentList '/C','{}' -Verb RunAs -WindowStyle Hidden -Wait; exit $LASTEXITCODE",
-        cmd.replace('\'', r#"'"#)
-    );
+async fn run_elevated_command(cmd: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let ps = format!(
+            "Start-Process -FilePath 'cmd.exe' -ArgumentList '/C','{}' -Verb RunAs -WindowStyle Hidden -Wait; exit $LASTEXITCODE",
+            cmd.replace('\'', r#"'"#)
+        );
 
-    let output = run_hidden_output("powershell", &["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &ps])
+        let output = run_hidden_output(
+            "powershell",
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                &ps,
+            ],
+        )
         .map_err(|e| format!("failed to spawn powershell: {}", e))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let code = output.status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let code = output.status.code().unwrap_or(-1);
 
-    if output.status.success() {
-        return Ok(());
-    }
+        if output.status.success() {
+            return Ok(());
+        }
 
-    if code == 1223 || stderr.to_lowercase().contains("canceled by the user") || stderr.to_lowercase().contains("operation was canceled") {
-        println!("Action was canceled by the user");
-        return Err("elevation canceled by user".into());
-    }
+        if code == 1223
+            || stderr.to_lowercase().contains("canceled by the user")
+            || stderr.to_lowercase().contains("operation was canceled")
+        {
+            println!("Action was canceled by the user");
+            return Err("elevation canceled by user".into());
+        }
 
-    Err(format!(
-        "elevated command failed: code={:?}, stdout={}, stderr={}",
-        code, stdout, stderr
-    ))
+        Err(format!(
+            "elevated command failed: code={:?}, stdout={}, stderr={}",
+            code, stdout, stderr
+        ))
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking join error: {}", e))?
 }
 
-fn configure_safe_dns(interface_name: &str, is_strict: bool) -> Result<(), String> {
+async fn configure_safe_dns(interface_name: &str, is_strict: bool) -> Result<(), String> {
     let (primary_dns, secondary_dns) = if is_strict {
         ("185.228.168.168", "185.228.169.168")
     } else {
@@ -391,8 +447,8 @@ fn configure_safe_dns(interface_name: &str, is_strict: bool) -> Result<(), Strin
         interface_name, primary_dns, interface_name, secondary_dns
     );
 
-    println!("Command: {}", netsh_command);
-    run_elevated_command(&netsh_command)
+    println!("Command: {}", &netsh_command);
+    run_elevated_command(netsh_command).await
 }
 
 #[tauri::command]
@@ -411,8 +467,7 @@ fn is_safe_search_enabled() -> Result<bool, String> {
 }
 
 #[tauri::command]
-fn enable_safe_search(app_handle: tauri::AppHandle) -> Result<bool, String>{
-    println!("add_safe_search_hosts: reading existing hosts file");
+async fn enable_safe_search(app_handle: tauri::AppHandle) -> Result<bool, String>{
     let current = match std::fs::read_to_string(HOSTS_PATH) {
         Ok(s) => s,
         Err(e) => {
@@ -450,7 +505,7 @@ fn enable_safe_search(app_handle: tauri::AppHandle) -> Result<bool, String>{
 
     let cmd = format!("move /Y \"{}\" \"{}\"", temp_path_str.replace('"', ""), HOSTS_PATH);
 
-    run_elevated_command(&cmd).map_err(|e| format!("elevated move failed: {}", e))?;
+    run_elevated_command(cmd).await.map_err(|e| format!("elevated move failed: {}", e))?;
     
     if let Err(e) = save_preference(
         "enforceSafeSearch".to_string(),
@@ -469,8 +524,10 @@ fn get_running_process_names() -> Result<HashSet<String>, String> {
     if !output.status.success() {
         return Err("tasklist failed".into());
     }
+
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut set = HashSet::new();
+
     for line in stdout.lines() {
         if let Some(name_field) = line.split(',').next() {
             let name = name_field.trim().trim_matches('"').to_lowercase();
@@ -480,11 +537,39 @@ fn get_running_process_names() -> Result<HashSet<String>, String> {
         }
     }
 
-    let mut names: Vec<_> = set.iter().cloned().collect();
-    names.sort();
-    //println!("All activeApps: {}", names.join(", "));
-
     Ok(set)
+}
+
+// Simple CSV parser for tasklist /FO CSV lines (handles quoted fields and embedded commas)
+fn parse_csv_line(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => {
+                if in_quotes {
+                    if matches!(chars.peek(), Some('"')) {
+                        // escaped quote inside quoted field
+                        cur.push('"');
+                        let _ = chars.next();
+                    } else {
+                        in_quotes = false;
+                    }
+                } else {
+                    in_quotes = true;
+                }
+            }
+            ',' if !in_quotes => {
+                out.push(cur.trim().to_string());
+                cur.clear();
+            }
+            _ => cur.push(ch),
+        }
+    }
+    out.push(cur.trim().to_string());
+    out
 }
 
 fn load_block_data(app_handle: &tauri::AppHandle) -> Result<serde_json::Map<String, serde_json::Value>, String> {
@@ -530,6 +615,232 @@ fn is_embedded_webview(process_name: &str) -> bool {
     p.contains("msedgewebview2") || p.contains("webview2") || p.contains("bravecrashhandler")
 }
 
+fn is_uninstaller_window_title(title: &str) -> bool {
+    let t = title.to_lowercase();
+    let has_app = t.contains("eagle blocker") || t.contains("eagleblocker");
+    let has_uninstall_intent = t.contains("uninstall") || t.contains("setup") || t.contains("installer");
+    has_app && has_uninstall_intent
+}
+
+fn is_uninstall_window_title_visible() -> Result<bool, String> {
+    let query = "eagleblocker Uninstall";
+    let output = run_hidden_output("tasklist", &["/FO", "CSV", "/NH", "/V"])
+        .map_err(|e| format!("tasklist /V spawn failed: {}", e))?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let needle = query.to_lowercase();
+    for line in stdout.lines() {
+        if line.trim().is_empty() { continue; }
+        let cols = parse_csv_line(line);
+        if cols.is_empty() { continue; }
+        let window_title = cols.last().map(|s| s.trim_matches('"')).unwrap_or("");
+        if !window_title.is_empty() && window_title.to_lowercase().contains(&needle) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(windows)]
+fn get_idle_millis() -> Result<u64, String> {
+    unsafe {
+        let mut lii = LASTINPUTINFO {
+            cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+            dwTime: 0,
+        };
+        if !GetLastInputInfo(&mut lii).as_bool() {
+            return Err("GetLastInputInfo failed".into());
+        }
+        let now = GetTickCount64();
+        let idle_ms = now.saturating_sub(lii.dwTime as u64);
+        Ok(idle_ms)
+    }
+}
+
+fn is_pc_idle(threshold_ms: u64) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        let idle = get_idle_millis()?;
+        return Ok(idle >= threshold_ms);
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(false)
+    }
+}
+
+fn is_system_proxy_enabled() -> bool {
+    if let Ok(hkcu) = RegKey::predef(HKEY_CURRENT_USER).open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings") {
+        if let Ok(enabled) = hkcu.get_value::<u32, _>("ProxyEnable") {
+            if enabled != 0 {
+                // Optional: ensure ProxyServer string is present
+                if let Ok(srv) = hkcu.get_value::<String, _>("ProxyServer") {
+                    return !srv.trim().is_empty();
+                }
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// Find Chromium profile Preferences files (Chrome/Edge/Brave default profiles)
+fn chromium_prefs_paths() -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let base = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from);
+    if base.is_none() { return out; }
+    let base = base.unwrap();
+
+    let candidates = [
+        ("Google\\Chrome\\User Data", "Default"),
+        ("Microsoft\\Edge\\User Data", "Default"),
+        ("BraveSoftware\\Brave-Browser\\User Data", "Default"),
+        ("Opera Software\\Opera Stable", ""), // Opera stores prefs directly in profile dir
+    ];
+
+    for (rel, profile) in candidates {
+        let mut p = base.clone();
+        p.push(rel);
+        if profile.is_empty() {
+            // Opera Stable
+            let mut f = p.clone();
+            f.push("Preferences");
+            if f.exists() { out.push(f); }
+        } else {
+            let mut f = p.clone();
+            f.push(profile);
+            f.push("Preferences");
+            if f.exists() { out.push(f); }
+        }
+    }
+
+    // Optionally scan a few numbered profiles (Profile 1..3)
+    for rel in ["Google\\Chrome\\User Data", "Microsoft\\Edge\\User Data", "BraveSoftware\\Brave-Browser\\User Data"] {
+        for i in 1..=3 {
+            let mut f = base.clone();
+            f.push(rel);
+            f.push(format!("Profile {}", i));
+            f.push("Preferences");
+            if f.exists() { out.push(f); }
+        }
+    }
+
+    out
+}
+
+// Check a Chromium Preferences JSON for proxy configured by user/extension
+fn prefs_indicates_proxy_enabled(pref_path: &std::path::Path) -> bool {
+    let Ok(text) = fs::read_to_string(pref_path) else { return false; };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) else { return false; };
+
+    // Common spot: "proxy": { "mode": "fixed_servers" | "pac_script" | "system" | "direct", "server": "...", "pac_url": "..." }
+    if let Some(proxy) = val.get("proxy").and_then(|v| v.as_object()) {
+        let mode = proxy.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+        let server = proxy.get("server").and_then(|v| v.as_str()).unwrap_or("");
+        let pac = proxy.get("pac_url").and_then(|v| v.as_str()).unwrap_or("");
+
+        // If extension controls proxy, mode can still be "direct"/"system", but server/pac may be set.
+        if mode.eq_ignore_ascii_case("fixed_servers") || mode.eq_ignore_ascii_case("pac_script") {
+            return true;
+        }
+        if !server.is_empty() || !pac.is_empty() {
+            return true;
+        }
+    }
+    false
+}
+
+// Look for running Chromium browsers started with proxy flags
+fn any_running_chromium_with_proxy_flags() -> bool {
+    // Use PowerShell to grab command lines for common browsers
+    let ps = r#"
+      Get-CimInstance Win32_Process |
+        Where-Object { $_.Name -match '^(chrome|msedge|brave|opera).exe$' } |
+        Select-Object -ExpandProperty CommandLine
+    "#;
+
+    if let Ok(out) = run_hidden_output(
+        "powershell",
+        &["-NoProfile","-NonInteractive","-WindowStyle","Hidden","-Command", ps]
+    ) {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).to_lowercase();
+            return s.contains("--proxy-server=") || s.contains("--proxy-pac-url=") || s.contains("--proxy-auto-detect");
+        }
+    }
+    false
+}
+
+// Heuristic: consider VPN-like if browser-level proxy is active
+fn is_browser_proxy_active() -> bool {
+    if is_system_proxy_enabled() {
+        return true;
+    }
+
+    if any_running_chromium_with_proxy_flags() {
+        return true;
+    }
+
+    for p in chromium_prefs_paths() {
+        if prefs_indicates_proxy_enabled(&p) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn is_vpn_active() -> Result<bool, String> {
+    // 1) Windows built-in VPN profiles (connected)
+    let ps1 = r#"
+        $c = Get-VpnConnection -AllUserConnection -ErrorAction SilentlyContinue |
+             Where-Object { $_.ConnectionStatus -eq 'Connected' } |
+             Select-Object -First 1;
+        if ($c) { '1' } else { '' }
+    "#;
+    if let Ok(out) = run_hidden_output(
+        "powershell",
+        &["-NoProfile","-NonInteractive","-WindowStyle","Hidden","-Command", ps1]
+    ) {
+        if out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "1" {
+            return Ok(true);
+        }
+    }
+
+    let ps2 = r#"
+        $rx = 'tap|tun|wireguard|vpn|openvpn|nordlynx|ikev2|l2tp|pptp|sstp'
+        $a = Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue |
+             Where-Object { $_.Status -eq 'Up' -and ( $_.Name -match $rx -or $_.InterfaceDescription -match $rx ) } |
+             Select-Object -First 1;
+        if ($a) { '1' } else { '' }
+    "#;
+    if let Ok(out) = run_hidden_output(
+        "powershell",
+        &["-NoProfile","-NonInteractive","-WindowStyle","Hidden","-Command", ps2]
+    ) {
+        if out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "1" {
+            return Ok(true);
+        }
+    }
+
+    if let Ok(running) = get_running_process_names() {
+        let known = [
+            "openvpn.exe","openvpn-gui.exe","wireguard.exe","wg.exe",
+            "protonvpn.exe","protonvpn-service.exe","nordvpn.exe","nordvpn-service.exe",
+            "expressvpn.exe","expressvpnd.exe","pia-service.exe","pia-client.exe",
+            "windscribe.exe","surfshark.exe","surfshark-service.exe","cyberghost.exe",
+            "forticlient.exe","globalprotect.exe","anyconnect.exe","snx.exe"
+        ];
+        if known.iter().any(|p| running.contains(&p.to_string())) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 #[tauri::command]
 fn turn_on_settings_and_app_protection(app_handle: tauri::AppHandle) -> Result<bool, String> {
     let mut guard = PROTECTION_HANDLE.lock().map_err(|e| e.to_string())?;
@@ -542,12 +853,24 @@ fn turn_on_settings_and_app_protection(app_handle: tauri::AppHandle) -> Result<b
 
     let app_clone = app_handle.clone();
     let handle = std::thread::spawn(move || {
-        let interval = Duration::from_secs(7);
+        let interval = Duration::from_secs(4);
         let sync_interval = Duration::from_secs(90);
         let mut last_sync = std::time::Instant::now();
         loop {
             if stop_flag.load(Ordering::SeqCst) {
                 break;
+            }
+
+            if is_vpn_active().unwrap_or(false) || is_browser_proxy_active() {
+                println!("vpn is active");
+            }
+            else{
+                println!("vpn is not active");
+            }
+
+            if is_pc_idle(2 * 60 * 1000).unwrap_or(false) {
+                std::thread::sleep(interval);
+                continue;
             }
 
             if last_sync.elapsed() >= sync_interval {
@@ -556,7 +879,7 @@ fn turn_on_settings_and_app_protection(app_handle: tauri::AppHandle) -> Result<b
                 }
                 last_sync = std::time::Instant::now();
             }
-
+            
             let is_settings_protection_on = read_preferences_for_key(&app_clone, "blockSettingsSwitch").unwrap_or(false);
 
             if !is_settings_protection_on {
@@ -568,50 +891,85 @@ fn turn_on_settings_and_app_protection(app_handle: tauri::AppHandle) -> Result<b
             let enabled = is_settings_protection_on && is_overlay_protection_on;
 
             if enabled {
-                match get_running_process_names() {
-                    Ok(running) => {
-                        let mut has_flagged = false;
-                        for (display, procs) in PROTECTED_SYSTEM_APPS.iter() {
-                            if procs.iter().any(|p| running.contains(*p)) {
-                                let _ = show_overlay(&app_clone, display, procs[0]);
-                                has_flagged = true;
-                                break;
-                            }
-                        }
-
-                        if has_flagged == false {
-                            if let Ok(block_map) = load_block_data(&app_clone) {
-                                let blocked_apps = collect_blocked_apps(&block_map);
-                                for (proc_name, display_name) in blocked_apps.iter() {
-                                    if process_matches_running(proc_name, &running) {
-                                        let _ = show_overlay(&app_clone, display_name, proc_name);
-                                        std::thread::sleep(Duration::from_secs(5));
-                                        has_flagged = true;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-
-                        if has_flagged == false && is_dns_protection_on {
-                            if BROWSER_DETECTOR.is_tor_proxy_running_enhanced() {
-                                for process_name in running.iter() {
-                                    if BROWSER_DETECTOR.is_browser_application(process_name) && !is_embedded_webview(process_name) {
-                                        let _ = show_overlay(&app_clone, process_name, process_name);
-                                        has_flagged = true;
-                                        println!("Found a registered browser running while the tor connection is on. Flagged!");
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-
-                        if has_flagged == false {
-                            close_overlay_window(app_clone.clone());
-                        }
+                let mut has_flagged = false;
+                if has_flagged == false {
+                    if is_uninstall_window_title_visible().unwrap_or(false) {
+                        let arguments = serde_json::json!({
+                            "displayName": UNINSTALL_OVERLAY_DISPLAY,
+                            "processName": "uninstaller",
+                            "code" : "uninstaller-window-detected"
+                        });
+                        let _ = show_overlay(&app_clone, arguments);
+                        has_flagged = true;
                     }
-                    Err(e) => eprintln!("protection thread: get_running_process_names failed: {}", e),
                 }
+
+                if !has_flagged {
+                    match get_running_process_names() {
+                        Ok(running) => {
+                            for (display, procs) in PROTECTED_SYSTEM_APPS.iter() {
+                                if procs.iter().any(|p| running.contains(*p)) {
+                                    let arguments = serde_json::json!({
+                                        "displayName": display,
+                                        "processName": procs[0],
+                                        "code" : "protected-system-app"
+                                    });
+
+                                    let _ = show_overlay(&app_clone, arguments);
+                                    has_flagged = true;
+                                    break;
+                                }
+                            }
+
+                            if has_flagged == false {
+                                if let Ok(block_map) = load_block_data(&app_clone) {
+                                    let blocked_apps = collect_blocked_apps(&block_map);
+                                    for (proc_name, display_name) in blocked_apps.iter() {
+                                        if process_matches_running(proc_name, &running) {
+                                            let arguments = serde_json::json!({
+                                                "displayName": display_name,
+                                                "processName": proc_name,
+                                                "code" : "blocked-app"
+                                            });
+                                            let _ = show_overlay(&app_clone, arguments);
+                                            has_flagged = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            if has_flagged == false && is_dns_protection_on {
+                                println!("Checking for browsers with tor proxy...");
+                                if BROWSER_DETECTOR.is_tor_proxy_running_enhanced() {
+                                    for process_name in running.iter() {
+                                        if BROWSER_DETECTOR.is_browser_application(process_name) && !is_embedded_webview(process_name) {
+                                            let arguments = serde_json::json!({
+                                                "displayName": process_name,
+                                                "processName": process_name,
+                                                "code" : "browser-with-proxy"
+                                            });
+
+                                            let _ = show_overlay(&app_clone, arguments);
+
+                                            has_flagged = true;
+                                            println!("Found a registered browser running while the tor connection is on. Flagged!");
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!("protection thread: get_running_process_names failed: {}", e),
+                    }
+                }
+
+                if has_flagged == false {
+                    close_overlay_window(app_clone.clone());
+                }
+            }
+            else{
+                return;
             }
 
             std::thread::sleep(interval);
@@ -620,35 +978,28 @@ fn turn_on_settings_and_app_protection(app_handle: tauri::AppHandle) -> Result<b
 
     *guard = Some(handle);
     let _ = create_eagle_task_schedule_simple();
-    println!("turn_on_settings_and_app_protection: protection thread started");
     Ok(true)
 }
 
-// ...existing code...
 fn perform_sync_recovery(app_handle: &tauri::AppHandle) -> Result<(), String> {
     println!("perform_sync_recovery: starting sync/recovery check");
 
     if let Err(_) = check_task_schedule_exists() {
-        println!("perform_sync_recovery: task schedule missing, recreating");
         let _ = create_eagle_task_schedule_simple();
     }
 
     let block_path = get_app_file_path(app_handle, "blockData.json")?;
     if !block_path.exists() || is_file_corrupted(&block_path) {
-        println!("perform_sync_recovery: blockData.json missing or corrupted, restoring default");
         restore_default_block_data(app_handle)?;
     }
 
     let prefs_path = get_app_file_path(app_handle, "savedPreferences.json")?;
     if !prefs_path.exists() || is_file_corrupted(&prefs_path) {
-        println!("perform_sync_recovery: savedPreferences.json missing or corrupted, restoring default");
         restore_default_preferences(app_handle)?;
     }
 
-    // Refresh caches from disk if currently empty
     if let Ok(mut guard) = BLOCK_DATA_CACHE.lock() {
         if guard.is_none() && block_path.exists() {
-            println!("perform_sync_recovery: refreshing empty cache");
             if let Ok(map) = read_json_map(&block_path) {
                 *guard = Some(map);
             }
@@ -657,25 +1008,21 @@ fn perform_sync_recovery(app_handle: &tauri::AppHandle) -> Result<(), String> {
 
     if let Ok(mut guard) = SAVED_PREFERENCES_CACHE.lock() {
         if guard.is_none() && prefs_path.exists() {
-            println!("perform_sync_recovery: refreshing empty cache");
             if let Ok(map) = read_json_map(&prefs_path) {
                 *guard = Some(map);
             }
         }
     }
 
-    // If cache exists and differs from disk, prefer cache and overwrite the stored file
     if let Ok(guard) = BLOCK_DATA_CACHE.lock() {
         if let Some(cached_map) = guard.as_ref() {
             match read_json_map(&block_path) {
                 Ok(stored_map) => {
                     if &stored_map != cached_map {
-                        println!("perform_sync_recovery: blockData.json differs from cache — overwriting file with cached data");
                         write_json_map(&block_path, cached_map)?;
                     }
                 }
                 Err(_) => {
-                    println!("perform_sync_recovery: failed to read blockData.json; writing cached data to disk");
                     write_json_map(&block_path, cached_map)?;
                 }
             }
@@ -687,19 +1034,16 @@ fn perform_sync_recovery(app_handle: &tauri::AppHandle) -> Result<(), String> {
             match read_json_map(&prefs_path) {
                 Ok(stored_prefs) => {
                     if &stored_prefs != cached_prefs {
-                        println!("perform_sync_recovery: savedPreferences.json differs from cache — overwriting file with cached preferences");
                         write_json_map(&prefs_path, cached_prefs)?;
                     }
                 }
                 Err(_) => {
-                    println!("perform_sync_recovery: failed to read savedPreferences.json; writing cached preferences to disk");
                     write_json_map(&prefs_path, cached_prefs)?;
                 }
             }
         }
     }
 
-    println!("perform_sync_recovery: completed successfully");
     Ok(())
 }
 
@@ -769,19 +1113,20 @@ fn read_preferences_for_key(app_handle: &tauri::AppHandle, key: &str) -> Result<
 
 #[tauri::command]
 fn close_app(process_name: String) -> Result<bool, String> {
-    let base = process_name.trim_end_matches(".exe");
-    let ps = format!("$proc = Get-Process -Name '{}' -ErrorAction SilentlyContinue; if ($proc) {{ Stop-Process -Name '{}' -Force -ErrorAction SilentlyContinue }}", base, base);
-    let _ = run_hidden_output("powershell", &["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &ps])
-        .map_err(|e| format!("failed to spawn powershell: {}", e))?;
+    let base = process_name.trim().trim_end_matches(".exe");
+    let target_exe = format!("{}.exe", base);
+
+    let _ = run_hidden_output("taskkill", &["/F", "/IM", &target_exe])
+        .map_err(|e| format!("failed to spawn taskkill: {}", e))?;
 
     let start = std::time::Instant::now();
-    while start.elapsed() < Duration::from_secs(60) {
+    while start.elapsed() < std::time::Duration::from_secs(60) {
         if let Ok(set) = get_running_process_names() {
-            if !set.contains(&format!("{}.exe", base)) && !set.contains(&base.to_string()) {
+            if !set.contains(&target_exe.to_lowercase()) && !set.contains(&base.to_lowercase()) {
                 return Ok(true);
             }
         }
-        thread::sleep(Duration::from_secs(5));
+        std::thread::sleep(std::time::Duration::from_secs(5));
     }
     Ok(false)
 }
@@ -794,6 +1139,7 @@ fn close_invoking_window(window: tauri::Window) -> Result<(), String> {
 #[tauri::command]
 fn close_overlay_window(app_handle: tauri::AppHandle){
     close_window(&app_handle, "overlay_window");
+    OVERLAY_OPEN.store(false, Ordering::SeqCst);
 }
 
 #[tauri::command]
@@ -978,40 +1324,41 @@ fn collect_app_paths() -> Vec<(String, String)> {
 }
 
 #[tauri::command]
-fn get_all_installed_apps() -> Result<Vec<serde_json::Value>, String> {
-    let mut apps: Vec<(String, String)> = Vec::new();
+async fn get_all_installed_apps() -> Result<Vec<serde_json::Value>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let mut apps: Vec<(String, String)> = Vec::new();
 
-    if let Ok(hklm) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall") {
-        apps.extend(read_uninstall_entries(hklm));
-    }
-
-    if let Ok(hklm32) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey("SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall") {
-        apps.extend(read_uninstall_entries(hklm32));
-    }
-
-    if let Ok(hkcu) = RegKey::predef(HKEY_CURRENT_USER).open_subkey("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall") {
-        apps.extend(read_uninstall_entries(hkcu));
-    }
-
-    let app_paths = collect_app_paths();
-    if !app_paths.is_empty() {
-        println!("get_all_installed_apps: adding {} entries from App Paths", app_paths.len());
-        for (d, p) in app_paths {
-            apps.push((d, p));
+        if let Ok(hklm) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall") {
+            apps.extend(read_uninstall_entries(hklm));
         }
-    }
 
-    apps.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
-    apps.dedup_by(|a, b| a.0.eq_ignore_ascii_case(&b.0));
+        if let Ok(hklm32) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey("SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall") {
+            apps.extend(read_uninstall_entries(hklm32));
+        }
 
-    let result: Vec<serde_json::Value> = apps.into_iter().map(|(display, process)| {
-        json!({
-            "displayName": display,
-            "processName": if process.is_empty() { serde_json::Value::String(String::new()) } else { serde_json::Value::String(process) }
-        })
-    }).collect();
+        if let Ok(hkcu) = RegKey::predef(HKEY_CURRENT_USER).open_subkey("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall") {
+            apps.extend(read_uninstall_entries(hkcu));
+        }
 
-    Ok(result)
+        let app_paths = collect_app_paths();
+        for (d, p) in app_paths { apps.push((d, p)); }
+
+        apps.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+        apps.dedup_by(|a, b| a.0.eq_ignore_ascii_case(&b.0));
+
+        let result: Vec<serde_json::Value> = apps.into_iter()
+            .map(|(display, process)| {
+                json!({
+                    "displayName": display,
+                    "processName": if process.is_empty() { serde_json::Value::String(String::new()) } else { serde_json::Value::String(process) }
+                })
+            })
+            .collect();
+
+        Ok(result)
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking join error: {}", e))?
 }
 
 fn handle_delay_changes(setting_id: String, value: Option<serde_json::Value>,app_handle: tauri::AppHandle) -> Result<(), String> {
@@ -1398,7 +1745,7 @@ fn menu_id_to_page(id: &str) -> Option<&'static str> {
 }
 
 #[tauri::command]
-fn add_block_website(site: String, app_handle: tauri::AppHandle) -> Result<bool, String> {
+async fn add_block_website(site: String, app_handle: tauri::AppHandle) -> Result<bool, String> {
     let site = site.trim();
     if site.is_empty() {
         return Err("empty site".into());
@@ -1430,7 +1777,7 @@ fn add_block_website(site: String, app_handle: tauri::AppHandle) -> Result<bool,
         let cmd = format!("move /Y \"{}\" \"{}\"", tmp_path_str.replace('"', ""), HOSTS_PATH);
         println!("add_block_website: requesting elevation to run: {}", cmd);
 
-        let _ = run_elevated_command(&cmd).map_err(|e| {
+        let _ = run_elevated_command(cmd).await.map_err(|e| {
             format!("elevated hosts update failed: {}", e)
         })?;
 
@@ -1487,7 +1834,7 @@ fn add_block_website(site: String, app_handle: tauri::AppHandle) -> Result<bool,
 }
 
 #[tauri::command]
-fn remove_block_website(site: String, app_handle: tauri::AppHandle) -> Result<bool, String> {
+async fn remove_block_website(site: String, app_handle: tauri::AppHandle) -> Result<bool, String> {
     let site = site.trim();
     if site.is_empty() {
         return Err("empty site".into());
@@ -1513,7 +1860,7 @@ fn remove_block_website(site: String, app_handle: tauri::AppHandle) -> Result<bo
         std::fs::write(&tmp_path, new_content.as_bytes()).map_err(|e| format!("failed to write temp hosts file: {}", e))?;
         let cmd = format!("move /Y \"{}\" \"{}\"", tmp_path_str.replace('"', ""), HOSTS_PATH);
 
-        if let Err(e) = run_elevated_command(&cmd) {
+        if let Err(e) = run_elevated_command(cmd).await {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(format!("elevated move failed: {}", e));
         }
@@ -1592,7 +1939,6 @@ fn reactivate_timers(app_handle: &tauri::AppHandle) -> Result<(), String> {
                     .or_else(|| entry.get("startTimeStamp").and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok()))
                     .unwrap_or(0);
 
-                // FIX: use delayTimeOutAtTimeOfChange (fallbacks kept for robustness)
                 let delay_ms = entry.get("delayTimeOutAtTimeOfChange")
                     .and_then(|v| v.as_u64())
                     .or_else(|| entry.get("delayTimeOutAtTimeOfChange").and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok()))
@@ -1645,17 +1991,13 @@ fn reactivate_timers(app_handle: &tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-fn create_eagle_task_schedule_simple() -> Result<bool, String> {
-    let default_app_path: Option<&str> = Some(r"C:\Program Files\Eagle Blocker\Eagle Blocker.exe");
+fn resolve_app_exe_path() -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe failed: {}", e))?;
+    Ok(exe.to_string_lossy().into_owned())
+}
 
-    let exe_path = if let Some(p) = default_app_path {
-        p.to_string()
-    } else {
-        std::env::current_exe()
-            .map_err(|e| format!("failed to determine current exe path: {}", e))?
-            .to_string_lossy()
-            .into_owned()
-    };
+fn create_eagle_task_schedule_simple() -> Result<bool, String> {
+    let exe_path = resolve_app_exe_path()?;
 
     let tr_value = format!("\"{}\"", exe_path.replace('"', "\\\""));
     let args = [
@@ -1726,34 +2068,58 @@ fn percent_encode(s: &str) -> String {
     out
 }
 
+fn overlay_is_open() -> bool {
+    OVERLAY_OPEN.load(Ordering::SeqCst)
+}
+
 #[tauri::command]
-fn show_overlay(app_handle: &tauri::AppHandle, display: &str, process: &str) -> Result<(),String> {
+fn show_overlay(app_handle: &tauri::AppHandle, arguments: serde_json::Value) -> Result<(), String> {
     if let Some(win) = app_handle.get_window("overlay_window") {
         let _ = win.show();
         let _ = win.set_focus();
         return Ok(());
     }
 
-    println!("Opening an overlay for app with : display='{}', process='{}'", display, process);
+    let obj = arguments.as_object();
+
+    let display = obj
+        .and_then(|m| m.get("displayName"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let process = obj
+        .and_then(|m| m.get("processName"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let code = obj
+        .and_then(|m| m.get("code"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
     let url = format!(
-        "overlayWindow.html?displayName={}&processName={}",
-        percent_encode(display),
-        percent_encode(process)
+        "overlayWindow.html?code={}&displayName={}&processName={}",
+        percent_encode(&code),
+        percent_encode(&display),
+        percent_encode(&process)
     );
 
-    if let Err(e) = 
-        tauri::WindowBuilder::new(app_handle, "overlay_window", tauri::WindowUrl::App(url.into()))
-            .title("Overlay")
-            .fullscreen(true)
-            .decorations(false)
-            .always_on_top(true)
-            .focused(true)
-            .visible(true)
-            .build() {
-                eprintln!("flag_app_overlay: failed to create overlay window: {}", e);
-            }
+    if let Err(e) = tauri::WindowBuilder::new(app_handle, "overlay_window", tauri::WindowUrl::App(url.into()))
+        .title("Overlay")
+        .fullscreen(false)
+        .decorations(false)
+        .always_on_top(false)
+        .focused(true)
+        .visible(true)
+        .build()
+    {
+        eprintln!("show_overlay: failed to create overlay window: {}", e);
+    }
 
+    OVERLAY_OPEN.store(true, Ordering::SeqCst);
     Ok(())
 }
 
@@ -1790,6 +2156,18 @@ fn ensure_overlay_below_main(app_handle: &tauri::AppHandle) {
     }
 }
 
+fn purge_old_powershell_task(task_name: &str) {
+    if let Ok(output) = run_hidden_output("schtasks", &["/Query", "/TN", task_name, "/V", "/FO", "LIST"]) {
+        if output.status.success() {
+            let txt = String::from_utf8_lossy(&output.stdout).to_lowercase();
+            if txt.contains("task to run:") && txt.contains("powershell.exe") {
+                let _ = run_hidden_output("schtasks", &["/Delete", "/TN", task_name, "/F"]);
+                println!("purged task '{}' that launched powershell.exe", task_name);
+            }
+        }
+    }
+}
+
 fn main() {
     const LOCK_ADDR: &str = "127.0.0.1:58859";
     let _lock = match TcpListener::bind(LOCK_ADDR) {
@@ -1802,6 +2180,7 @@ fn main() {
 
     tauri::Builder::default()
         .setup(|app| {
+            purge_old_powershell_task("EagleElevate");
             let app_handle = app.app_handle();
             if let Err(e) = reactivate_timers(&app_handle) {
                 eprintln!("reactivate_timers failed during setup: {}", e);
@@ -1813,7 +2192,7 @@ fn main() {
         .on_window_event(|event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event.event() {
                 let label  = event.window().label();
-                if label == "main" || label == "overlay_window" {
+                if label == "main1" || label == "overlay_window1" {
                     let should_block = read_preferences_for_key(&event.window().app_handle(), "blockSettingsSwitch").unwrap_or(false);
                     if should_block {
                         api.prevent_close();

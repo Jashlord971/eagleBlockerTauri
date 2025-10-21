@@ -20,6 +20,16 @@ winreg = "0.50"
 rayon = "1.7"
 get_if_addrs = "0.5"
 sysinfo = "0.28.4"
+windows = { version = "0.58.0", features = [
+  "Win32_Foundation",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_Threading",
+  "Win32_System_Registry",
+  "Win32_UI_Input_KeyboardAndMouse",
+   "Win32_System_SystemInformation"
+] }
+runas = "0.2"
 
 [features]
 # This feature is used for production builds or when a dev server is not specified, DO NOT REMOVE!!
