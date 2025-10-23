@@ -3,6 +3,7 @@ use std::net::{TcpStream, SocketAddr};
 use std::time::Duration;
 use std::path::Path;
 use winreg::{RegKey, enums::*};
+use std::process::Command;
 
 pub struct BrowserDetector {
     known_browsers: HashSet<String>,
@@ -235,22 +236,6 @@ impl BrowserDetector {
         } else {
             None
         }
-    }
-    
-    fn is_tor_proxy_configured(&self) -> bool {
-        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        if let Ok(internet_settings) = hkcu.open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings") {
-            if let Ok(proxy_enable) = internet_settings.get_value::<u32, _>("ProxyEnable") {
-                if proxy_enable == 1 {
-                    if let Ok(proxy_server) = internet_settings.get_value::<String, _>("ProxyServer") {
-                        return proxy_server.contains("127.0.0.1:9050") || 
-                            proxy_server.contains("127.0.0.1:9150") ||
-                            proxy_server.contains("localhost:9050");
-                    }
-                }
-            }
-        }
-        false
     }
 
     pub fn is_browser_application(&self, process_name: &str) -> bool {

@@ -9,7 +9,6 @@ let dnsDialog = null;
 let tooltipsInitialized = false;
 
 const KEYS = [
-    'overlayRestrictedContent',
     "enableProtectiveDNS",
     'blockSettingsSwitch',
     "enforceSafeSearch"
@@ -66,11 +65,11 @@ function initTooltips() {
 window.addEventListener('DOMContentLoaded', () => init());
 
 function init(){
-    initializeOverlaySwitch();
     initializeEnableProtectiveDns();
     initializeSettingsAndAppProtection();
     initializeSafeSearchProtection();
     listenForRefresh();
+    listenForUpdate();
     listenForTimerUpdate();
     initTooltips();
 
@@ -127,28 +126,6 @@ function openConfirmationDialog(key){
 
 function openDnsStrictnessLevelDialog(){
     invoke("show_dns_confirmation_modal");
-}
-
-async function initializeOverlaySwitch() {
-    const key = 'overlayRestrictedContent';
-    const overlaySwitch = document.getElementById(key);
-    if (!overlaySwitch){
-        return;
-    }
-
-    const isChecked = await getPreference(key);
-    overlaySwitch.checked = isChecked;
-  
-    overlaySwitch.addEventListener('change', async () => {
-        const value = await getPreference(key);
-        if (value) {
-            overlaySwitch.checked = true;
-            openConfirmationDialog(key);
-        }
-        else {
-            saveSharedPreference(key);
-        } 
-    });
 }
 
 function showElement(id) {
@@ -252,6 +229,10 @@ function listenForRefresh(){
         invoke('close_confirmation_dialog');
         window.location.reload();
     });
+}
+
+function listenForUpdate(){
+    return listen("main-config-updated", () => window.location.reload());
 }
 
 function listenForTimerUpdate(){

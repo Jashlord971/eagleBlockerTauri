@@ -151,19 +151,9 @@
     <h1>Main Configurations</h1>
 
     <div class="pref-row">
-        <div class="label-text">Enable Overlay Over Restricted Content</div>
-        <div class="timer-icon is-hidden" id="timer-overlayRestrictedContent" data-description="Is undergoing a delay change. Tap switch to see details.">⏱️</div>
-        <div class="info-icon" data-description="This shows a fullscreen overlay when restricted apps are opened.">💡</div>
-        <label class="switch">
-            <input type="checkbox" id="overlayRestrictedContent">
-            <span class="slider"></span>
-        </label>
-    </div>
-
-    <div class="pref-row">
         <div class="label-text">Enable Protective DNS</div>
         <div class="timer-icon is-hidden" id="timer-enableProtectiveDNS" data-description="Is undergoing a delay change. Tap switch to see details.">⏱️</div>
-        <div class="info-icon" data-description="Protects your searches by filtering adult or harmful content.">💡</div>
+        <div class="info-icon" data-description="Protects your searches by filtering adult or harmful content and enforces that only our supported browsers will be allowed for browsing. In the case a proxy extension is found active in a supported browser, that supported browser will be blacklisted.">💡</div>
         <label class="switch">
             <input type="checkbox" id="enableProtectiveDNS">
             <span class="slider"></span>
@@ -173,7 +163,7 @@
     <div class="pref-row">
         <div class="label-text">Settings and App Protection</div>
         <div class="timer-icon is-hidden" id="timer-blockSettingsSwitch" data-description="Is undergoing a delay change. Tap switch to see details.">⏱️</div>
-        <div class="info-icon" data-description="Allows the app to block sensitive system settings when enabled. This includes protections against having the app installed">💡</div>
+        <div class="info-icon" data-description="Allows the app to block sensitive system settings when enabled. This includes protections against having the app uninstalled">💡</div>
         <label class="switch">
             <input type="checkbox" id="blockSettingsSwitch">
             <span class="slider"></span>
@@ -189,6 +179,7 @@
             <span class="slider"></span>
         </label>
     </div>
+
 </div>
 
 <script src="mainConfig.js"></script>

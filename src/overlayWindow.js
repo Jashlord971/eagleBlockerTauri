@@ -12,6 +12,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 function setUpAppInfo(){
     const params = new URLSearchParams(window.location.search);
     appInfo = {
+        code: params.get('code') || '',
         displayName: params.get('displayName') || '',
         processName: params.get('processName') || params.get('procName') || params.get('process') || ''
     };
@@ -24,10 +25,9 @@ function setUpAppInfo(){
     const processNameLower = rawProc.toLowerCase();
     const processFile = processNameLower.split('\\').pop().split('/').pop();
 
-    const systemApps = new Set(['taskmgr.exe', 'mmc.exe', 'control.exe', 'systemsettings.exe']);
-    const isSystem = systemApps.has(processFile) || systemApps.has(processNameLower) || /\\system32\\taskmgr\.exe$/i.test(rawProc);
+    const code = appInfo.code || '';
 
-    if (isSystem) {
+    if (code === 'protected-system-app') {
         const paragraph = document.getElementById('warning-paragraph');
         if (paragraph) {
             paragraph.textContent =
@@ -42,7 +42,38 @@ function setUpAppInfo(){
         const alt = document.getElementById('altButton');
         if (alt) alt.style.display = 'inline-block';
     }
+    else if(code === 'browser-with-proxy'){
+        const paragraph = document.getElementById('warning-paragraph'); 
+        if (paragraph) {
+            paragraph.textContent =
+                "We noticed a browser application running while TOR, a VPN, or Proxy is active on your system. " +
+                "For your safety, please close the browser to allow this overlay to close automatically.";
+        }
 
+        const closeButton = document.getElementById('closeBtn');
+        if (closeButton) closeButton.style.display = 'none';
+
+        showElement('hidden');
+        const alt = document.getElementById('altButton');
+        if (alt) alt.style.display = 'inline-block';
+    }
+    else if(code === "uninstaller-window-detected"){
+        const paragraph = document.getElementById('warning-paragraph');
+        if (paragraph) {
+            paragraph.textContent =
+                "We detected that the Eagle Blocker uninstaller window is open. " +
+                "Please close the uninstaller window to allow this overlay to close automatically.";
+        }
+
+        const closeButton = document.getElementById('closeBtn');
+        if (closeButton) closeButton.style.display = 'none';
+
+        showElement('hidden');
+        const alt = document.getElementById('altButton');
+        if (alt) alt.style.display = 'inline-block';
+    }
+
+    const isSystem = code === 'protected-system-app';
     console.log('overlay appInfo:', appInfo, { processFile, isSystem });
 }
 
