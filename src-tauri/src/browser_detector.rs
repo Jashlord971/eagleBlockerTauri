@@ -6,7 +6,7 @@ use winreg::{RegKey, enums::*};
 use std::process::Command;
 
 pub struct BrowserDetector {
-    known_browsers: HashSet<String>,
+    pub known_browsers: HashSet<String>,
     tor_browsers: HashSet<String>,
     registered_browsers: Vec<String>,
 }
@@ -32,8 +32,16 @@ impl BrowserDetector {
             "360chrome.exe",
             "duckduckgo.exe", 
             "chromium.exe", 
-            "edge.exe"
-        ].iter().map(|s| s.to_lowercase()).collect();
+            "edge.exe",
+            "arc.exe", 
+            "avgbrowser.exe", 
+            "chrome_proxy.exe", 
+            "opera_gx.exe",
+            "shift.exe"
+        ]
+        .iter()
+        .map(|s| s.to_lowercase())
+        .collect();
 
         let tor_browsers = [
             "tor.exe", 

@@ -539,7 +539,6 @@ fn get_running_process_names() -> Result<HashSet<String>, String> {
     Ok(set)
 }
 
-// Simple CSV parser for tasklist /FO CSV lines (handles quoted fields and embedded commas)
 fn parse_csv_line(line: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -550,7 +549,6 @@ fn parse_csv_line(line: &str) -> Vec<String> {
             '"' => {
                 if in_quotes {
                     if matches!(chars.peek(), Some('"')) {
-                        // escaped quote inside quoted field
                         cur.push('"');
                         let _ = chars.next();
                     } else {
@@ -770,63 +768,83 @@ fn turn_on_settings_and_app_protection(app_handle: tauri::AppHandle) -> Result<b
                                         }
                                     }
                                 }
-                                if has_flagged == true {
-                                    continue;
+
+                                if has_flagged == false {
+                                    let browser_process_names = BROWSER_DETECTOR.known_browsers.iter()
+                                        .map(|b| b.to_lowercase())
+                                        .filter(|p| p != "brave.exe" && p != "chrome.exe" && p != "msedge.exe")
+                                        .collect::<HashSet<String>>();
+
+                                    for process_name in browser_process_names.iter() {
+                                        if running.contains(process_name) {
+                                            let arguments = serde_json::json!({
+                                                "displayName": process_name,
+                                                "processName": process_name,
+                                                "code" : "unsupported_browser"
+                                            });
+
+                                            let _ = show_overlay(&app_clone, arguments);
+
+                                            has_flagged = true;
+                                            println!("Found a registered browser running while the tor connection is on. Flagged!");
+                                            break;
+                                        }
+                                    }
                                 }
+                            }
 
-                                if running.contains(&"brave.exe".to_string())  || running.contains(&"chrome.exe".to_string()) || running.contains(&"msedge.exe".to_string()) {
-                                    match detect_vpn_proxy_all_browsers() {
-                                        Ok(extensions) => {
-                                            if !extensions.is_empty() {
-                                                let mut browsers: HashSet<String> = HashSet::new();
-                                                for ext in extensions.iter() {
-                                                    let is_vpn = ext.get("is_vpn").and_then(|v| v.as_bool()).unwrap_or(false);
-                                                    let has_proxy = ext.get("has_proxy_permission").and_then(|v| v.as_bool()).unwrap_or(false);
-                                                    if is_vpn && has_proxy {
-                                                        if let Some(bname) = ext.get("browser").and_then(|v| v.as_str()) {
-                                                            browsers.insert(bname.to_string());
-                                                        }
+                            if running.contains(&"brave.exe".to_string()) || running.contains(&"chrome.exe".to_string()) || running.contains(&"msedge.exe".to_string()) {
+                                match detect_vpn_proxy_all_browsers() {
+                                    Ok(extensions) => {
+                                        if !extensions.is_empty() {
+                                            let mut browsers: HashSet<String> = HashSet::new();
+                                            for ext in extensions.iter() {
+                                                let is_vpn = ext.get("is_vpn").and_then(|v| v.as_bool()).unwrap_or(false);
+                                                let has_proxy = ext.get("has_proxy_permission").and_then(|v| v.as_bool()).unwrap_or(false);
+                                                if is_vpn && has_proxy {
+                                                    if let Some(bname) = ext.get("browser").and_then(|v| v.as_str()) {
+                                                        browsers.insert(bname.to_string());
                                                     }
                                                 }
-
-                                                let map_proc = |b: &str| -> Option<(&'static str, &'static str)> {
-                                                    match b {
-                                                        "Chrome" => Some(("Google Chrome", "chrome.exe")),
-                                                        "Edge" => Some(("Microsoft Edge", "msedge.exe")),
-                                                        "Brave" => Some(("Brave", "brave.exe")),
-                                                        _ => None,
-                                                    }
-                                                };
-
-                                                let mut blocked = false;
-                                                for b in browsers {
-                                                    if let Some((display, exe)) = map_proc(&b) {
-                                                        if running.contains(&exe.to_lowercase()) {
-                                                            let _ = show_overlay(
-                                                                &app_clone,
-                                                                serde_json::json!({
-                                                                    "displayName": display,
-                                                                    "processName": exe,
-                                                                    "code": "browser-with-vpn"
-                                                                }),
-                                                            );
-                                                            has_flagged = true;
-                                                            blocked = true;
-                                                            break;
-                                                        }
-                                                    }
-                                                }
-
-                                                if !blocked {
-                                                    println!("VPN extensions present, but none of the affected browsers are currently running.");
-                                                }
-                                            } else {
-                                                println!("✅ No VPN proxy extensions detected");
                                             }
+
+                                            let map_proc = |b: &str| -> Option<(&'static str, &'static str)> {
+                                                match b {
+                                                    "Chrome" => Some(("Google Chrome", "chrome.exe")),
+                                                    "Edge" => Some(("Microsoft Edge", "msedge.exe")),
+                                                    "Brave" => Some(("Brave", "brave.exe")),
+                                                    _ => None,
+                                                }
+                                            };
+
+                                            let mut blocked = false;
+                                            for b in browsers {
+                                                if let Some((display, exe)) = map_proc(&b) {
+                                                    if running.contains(&exe.to_lowercase()) {
+                                                        let _ = show_overlay(
+                                                            &app_clone,
+                                                            serde_json::json!({
+                                                                "displayName": display,
+                                                                "processName": exe,
+                                                                "code": "browser-with-vpn"
+                                                            }),
+                                                        );
+                                                        has_flagged = true;
+                                                        blocked = true;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+
+                                            if !blocked {
+                                                println!("VPN extensions present, but none of the affected browsers are currently running.");
+                                            }
+                                        } else {
+                                            println!("✅ No VPN proxy extensions detected");
                                         }
-                                        Err(e) => {
-                                            eprintln!("VPN detection thread: detection failed: {}", e);
-                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("VPN detection thread: detection failed: {}", e);
                                     }
                                 }
                             }
@@ -1085,8 +1103,6 @@ fn detect_vpn_proxy_all_browsers() -> Result<Vec<serde_json::Value>, String> {
         }
     }
 
-    // Fallback: Rust filesystem scan (kept as-is)
-    // ...existing code...
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .ok_or("LOCALAPPDATA not found")?;
@@ -1270,15 +1286,10 @@ fn read_preferences_for_key(app_handle: &tauri::AppHandle, key: &str) -> Result<
 
 #[tauri::command]
 fn close_app(app_handle: tauri::AppHandle, process_name: String) -> Result<bool, String> {
-    // Do not block the command thread
     std::thread::spawn(move || {
         let base = process_name.trim().trim_end_matches(".exe").to_string();
         let target_exe = format!("{}.exe", base);
-
-        // Try to kill the process (hidden)
         let _ = run_hidden_output("taskkill", &["/F", "/IM", &target_exe]);
-
-        // Poll up to 60s for process to be gone (responsive 500ms step)
         let start = std::time::Instant::now();
         let mut success = false;
         while start.elapsed() < std::time::Duration::from_secs(60) {
@@ -1289,22 +1300,12 @@ fn close_app(app_handle: tauri::AppHandle, process_name: String) -> Result<bool,
                         break;
                     }
                 }
-                Err(_) => { /* ignore */ }
+                Err(_) =>  {}
             }
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
-
-        // Notify the UI
-        let _ = app_handle.emit_all(
-            "close-app-result",
-            serde_json::json!({
-                "processName": process_name,
-                "success": success
-            }),
-        );
     });
 
-    // Return immediately so the UI stays responsive
     Ok(true)
 }
 
