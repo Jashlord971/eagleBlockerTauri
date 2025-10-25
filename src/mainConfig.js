@@ -3,12 +3,13 @@ const { listen, emit } = window.__TAURI__.event;
 const { WebviewWindow } = window.__TAURI__.window;
 
 let overlayWindow = null;
-let confirmDialog = null;
+let confirmDialog = null;    
 let dnsDialog = null;
 
 let tooltipsInitialized = false;
 
 const KEYS = [
+    'overlayRestrictedContent',
     "enableProtectiveDNS",
     'blockSettingsSwitch',
     "enforceSafeSearch"
@@ -65,13 +66,15 @@ function initTooltips() {
 window.addEventListener('DOMContentLoaded', () => init());
 
 function init(){
+    initializeOverlaySwitch();
     initializeEnableProtectiveDns();
     initializeSettingsAndAppProtection();
     initializeSafeSearchProtection();
     listenForRefresh();
-    listenForUpdate();
     listenForTimerUpdate();
     initTooltips();
+
+    listen("block-data-updated", () => window.location.reload());
 
     Array.from(KEYS).map(key => showTimerIcon(key));
 }
@@ -125,7 +128,44 @@ function openConfirmationDialog(key){
 }
 
 function openDnsStrictnessLevelDialog(){
-    invoke("show_dns_confirmation_modal");
+    if(dnsDialog){
+        return;
+    }
+
+    const url = "dnsConfirmationModal.html";
+    const config = {
+        url,
+        title: 'DNS strictness level',
+        width: 450,
+        height: 250,
+        alwaysOnTop: true,
+        focus: true
+    };
+
+    dnsDialog = new WebviewWindow('dnsDialog', config);
+    dnsDialog.once('tauri://destroyed', () => { dnsDialog = null; });
+}
+
+async function initializeOverlaySwitch() {
+    const key = 'overlayRestrictedContent';
+    const overlaySwitch = document.getElementById(key);
+    if (!overlaySwitch){
+        return;
+    }
+
+    const isChecked = await getPreference(key);
+    overlaySwitch.checked = isChecked;
+  
+    overlaySwitch.addEventListener('change', async () => {
+        const value = await getPreference(key);
+        if (value) {
+            overlaySwitch.checked = true;
+            openConfirmationDialog(key);
+        }
+        else {
+            saveSharedPreference(key);
+        } 
+    });
 }
 
 function showElement(id) {
@@ -169,20 +209,18 @@ async function initializeSettingsAndAppProtection(){
     const key = 'blockSettingsSwitch';
     const settingsAndAppProtectionSwitch = document.getElementById(key);
 
-    invoke('activate_app_and_settings_protection');
     if(!settingsAndAppProtectionSwitch){
         return;
     }
 
-    //const isChecked = await getPreference(key);
-    const isChecked = false;
+    const isChecked = await getPreference(key);
     if(isChecked){
-        invoke('activate_app_and_settings_protection');
+        invoke('turn_on_settings_and_app_protection');
     } else{
         invoke('stop_settings_and_app_protection');
     }
+
     settingsAndAppProtectionSwitch.checked = isChecked;
-    settingsAndAppProtectionSwitch.checked = false;
 
     settingsAndAppProtectionSwitch.addEventListener('change', async () => {
         const isSettingsProtectionActive = await getPreference(key);
@@ -191,8 +229,8 @@ async function initializeSettingsAndAppProtection(){
             openConfirmationDialog(key);
         }
         else{
-            invoke('activate_app_and_settings_protection');
-            //saveSharedPreference(key);
+            invoke('activate_app_and_settings_protection')
+                .then(() => saveSharedPreference(key));
         }
     });
 }
@@ -232,10 +270,6 @@ function listenForRefresh(){
         invoke('close_confirmation_dialog');
         window.location.reload();
     });
-}
-
-function listenForUpdate(){
-    return listen("main-config-updated", () => window.location.reload());
 }
 
 function listenForTimerUpdate(){

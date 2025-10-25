@@ -18,7 +18,7 @@ async function init(){
             if(!statusChange.isChanging){
                 return;
             }
-            const delayTime = statusChange.delayTimeOutAtTimeOfChange || statusChange.currentTimeout;
+            const delayTime = statusChange.delayTimeOutAtTimeOfChange || statusChange.currentTimeout || 180000;
             showProgressBar(statusChange.timeRemaining, delayTime);
         });
 
@@ -53,7 +53,6 @@ function closeModal(){
     invoke('close_invoking_window');
 }
 
-// ...existing code...
 function showProgressBar(timeRemaining, delayTimeOutAtTimeOfChange){
     const confirmDialog = document.getElementById("confirm-modal");
     const progressContainer = document.getElementById('progressContainer');
@@ -70,7 +69,6 @@ function showProgressBar(timeRemaining, delayTimeOutAtTimeOfChange){
     confirmDialog.style.display = 'none';
     progressContainer.style.display = 'block';
 
-    // Coerce to numbers and guard against zero/NaN
     const total = Number(delayTimeOutAtTimeOfChange) || Number(timeRemaining) || 1;
     const endTime = Date.now() + (Number(timeRemaining) || 0);
 
@@ -105,4 +103,3 @@ function showProgressBar(timeRemaining, delayTimeOutAtTimeOfChange){
     updateProgress();
     interval = setInterval(updateProgress, 1000);
 }
-// ...existing code...

@@ -26,6 +26,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::time::{SystemTime, UNIX_EPOCH};
 use once_cell::sync::Lazy;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -1271,7 +1273,9 @@ fn is_file_corrupted(path: &std::path::PathBuf) -> bool {
 
 fn resolve_prod_exe_path() -> Result<String, String> {
     let candidates = [
-        r"C:\Program Files\EagleBlocker\EagleBlocker.exe",
+        r"C:\Program Files\EagleBlocker\eagleblocker.exe",  // lowercase (actual file)
+        r"C:\Program Files\EagleBlocker\EagleBlocker.exe",   // capitalized (old reference)
+        r"C:\Program Files (x86)\EagleBlocker\eagleblocker.exe",
         r"C:\Program Files (x86)\EagleBlocker\EagleBlocker.exe",
     ];
     for c in candidates {
@@ -2229,13 +2233,17 @@ sh.Run """" & "{exe}" & """", 0, False
 }
 
 fn create_eagle_task_schedule_simple() -> Result<bool, String> {
+    /*
     if let Ok(q) = run_hidden_output("schtasks", &["/Query", "/TN", TASK_NAME]) {
         if q.status.success() {
+            println!("Returning early");
             return Ok(true);
         }
     }
+    */
 
     let exe_path = resolve_prod_exe_path()?;
+    println!("exe_path: {}", exe_path.clone());
     let tr_value = format!(r#""{}""#, exe_path.replace('"', "\\\""));
 
     purge_old_powershell_task(TASK_NAME);
@@ -2253,6 +2261,7 @@ fn create_eagle_task_schedule_simple() -> Result<bool, String> {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     if output.status.success() {
+        println!("Successfully set the task schedule");
         Ok(true)
     } else {
         Err(format!("schtasks failed: code={:?}, stdout={}, stderr={}", output.status.code(), stdout, stderr))
@@ -2271,6 +2280,9 @@ async fn activate_app_and_settings_protection(app_handle: tauri::AppHandle) -> R
         name = TASK_NAME,
         tr = exe_quoted
     );
+
+    println!("schtasks_cmd: {}", schtasks_cmd);
+
     let reg_cmd = format!(
         r#"reg add "{runkey}" /v "{valname}" /t REG_SZ /d {tr} /f"#,
         runkey = RUN_KEY_ALL_USERS,
@@ -2278,7 +2290,8 @@ async fn activate_app_and_settings_protection(app_handle: tauri::AppHandle) -> R
         tr = exe_quoted
     );
 
-    // Run both elevated in one shot
+    println!("reg_cmd: {}", reg_cmd);
+
     let combined = format!(r#"{schtasks} && {reg}"#, schtasks = schtasks_cmd, reg = reg_cmd);
 
     if let Err(e) = run_elevated_command(combined).await {
@@ -2343,6 +2356,7 @@ fn show_overlay(app_handle: &tauri::AppHandle, arguments: serde_json::Value) -> 
     if let Some(win) = app_handle.get_window("overlay_window") {
         let _ = win.show();
         let _ = win.set_focus();
+        println!("Overlay window already exists");
         return Ok(());
     }
 
@@ -2434,6 +2448,19 @@ fn purge_old_powershell_task(task_name: &str) {
     }
 }
 
+fn get_user_specific_lock_port() -> Result<String, String> {
+    let username = std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "default".to_string());
+    
+    let mut hasher = DefaultHasher::new();
+    username.hash(&mut hasher);
+    let hash = hasher.finish();
+    
+    let port = 58860 + (hash % 1000);
+    Ok(format!("127.0.0.1:{}", port))
+}
+
 #[tauri::command]
 fn disable_autostart(app_handle: tauri::AppHandle) -> Result<bool, String> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
@@ -2449,11 +2476,20 @@ fn disable_autostart(app_handle: tauri::AppHandle) -> Result<bool, String> {
 }
 
 fn main() {
-    const LOCK_ADDR: &str = "127.0.0.1:58859";
-    let _lock = match TcpListener::bind(LOCK_ADDR) {
+    let lock_addr = match get_user_specific_lock_port() {
+        Ok(addr) => addr,
+        Err(e) => {
+            eprintln!("Failed to get user-specific lock port: {}", e);
+            return;
+        }
+    };
+    
+    println!("Using lock address: {}", lock_addr);
+    
+    let _lock = match TcpListener::bind(&lock_addr) {
         Ok(l) => l,
         Err(_) => {
-            println!("Another instance is running; exiting.");
+            println!("Another instance is already running for this user; exiting.");
             return;
         }
     };
@@ -2464,6 +2500,8 @@ fn main() {
             let app_handle = app.app_handle();
             let app_clone = app_handle.clone();
             enable_autostart(app_clone)?;
+    
+    
             if let Err(e) = reactivate_timers(&app_handle) {
                 eprintln!("reactivate_timers failed during setup: {}", e);
             }
