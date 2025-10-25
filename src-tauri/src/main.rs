@@ -88,6 +88,10 @@ const HOSTS_PATH: &str = r"C:\Windows\System32\drivers\etc\hosts";
 const DELAY_SETTINGS: &str = "delayTimeOut";
 const UNINSTALL_OVERLAY_DISPLAY: &str = "Uninstaller";
 
+const RUN_VALUE_NAME: &str = "EagleBlocker";
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const RUN_KEY_ALL_USERS: &str = r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run";
+
 fn get_preferences_path(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
     let mut path = app_data_dir(&app_handle.config()).ok_or("No app data dir")?;
     path.push("savedPreferences.json");
@@ -1265,6 +1269,32 @@ fn is_file_corrupted(path: &std::path::PathBuf) -> bool {
     }
 }
 
+fn resolve_prod_exe_path() -> Result<String, String> {
+    let candidates = [
+        r"C:\Program Files\EagleBlocker\EagleBlocker.exe",
+        r"C:\Program Files (x86)\EagleBlocker\EagleBlocker.exe",
+    ];
+    for c in candidates {
+        let p = PathBuf::from(c);
+        if p.exists() {
+            return Ok(p.to_string_lossy().into_owned());
+        }
+    }
+    resolve_app_exe_path()
+}
+
+fn enable_autostart(app_handle: tauri::AppHandle) -> Result<bool, String> {
+    let exe = resolve_app_exe_path()?;
+    let quoted = format!(r#""{}""#, exe);
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let (key, _) = hkcu.create_subkey(RUN_KEY).map_err(|e| e.to_string())?;
+    key.set_value(RUN_VALUE_NAME, &quoted).map_err(|e| e.to_string())?;
+
+    let _ = save_preference("autoStart".to_string(), serde_json::Value::Bool(true), app_handle);
+    Ok(true)
+}
+
 #[tauri::command]
 fn stop_settings_and_app_protection() -> Result<bool, String> {
     let _ = remove_eagle_task_schedule_simple();
@@ -2199,22 +2229,23 @@ sh.Run """" & "{exe}" & """", 0, False
 }
 
 fn create_eagle_task_schedule_simple() -> Result<bool, String> {
-    let vbs_path = ensure_hidden_launcher_vbs()?;
-    let vbs_str = vbs_path.to_string_lossy().into_owned();
+    if let Ok(q) = run_hidden_output("schtasks", &["/Query", "/TN", TASK_NAME]) {
+        if q.status.success() {
+            return Ok(true);
+        }
+    }
 
-    let tr_value = format!("wscript.exe //nologo \"{}\"", vbs_str.replace('"', "\\\""));
+    let exe_path = resolve_prod_exe_path()?;
+    let tr_value = format!(r#""{}""#, exe_path.replace('"', "\\\""));
+
+    purge_old_powershell_task(TASK_NAME);
 
     let args = [
-        "/Create",
-        "/F",
-        "/SC",
-        "MINUTE",
-        "/MO",
-        "1",
-        "/TN",
-        TASK_NAME,
-        "/TR",
-        &tr_value,
+        "/Create", "/F",
+        "/SC", "MINUTE",
+        "/MO", "1",
+        "/TN", TASK_NAME,
+        "/TR", &tr_value,
     ];
 
     let output = run_hidden_output("schtasks", &args).map_err(|e| format!("failed to spawn schtasks: {}", e))?;
@@ -2225,6 +2256,41 @@ fn create_eagle_task_schedule_simple() -> Result<bool, String> {
         Ok(true)
     } else {
         Err(format!("schtasks failed: code={:?}, stdout={}, stderr={}", output.status.code(), stdout, stderr))
+    }
+}
+
+#[tauri::command]
+async fn activate_app_and_settings_protection(app_handle: tauri::AppHandle) -> Result<bool, String> {
+    let exe = resolve_prod_exe_path()?;
+    let exe_quoted = format!(r#""{}""#, exe.replace('"', ""));
+
+    purge_old_powershell_task(TASK_NAME);
+
+    let schtasks_cmd = format!(
+        r#"schtasks /Create /F /SC ONLOGON /TN "{name}" /TR {tr}"#,
+        name = TASK_NAME,
+        tr = exe_quoted
+    );
+    let reg_cmd = format!(
+        r#"reg add "{runkey}" /v "{valname}" /t REG_SZ /d {tr} /f"#,
+        runkey = RUN_KEY_ALL_USERS,
+        valname = RUN_VALUE_NAME,
+        tr = exe_quoted
+    );
+
+    // Run both elevated in one shot
+    let combined = format!(r#"{schtasks} && {reg}"#, schtasks = schtasks_cmd, reg = reg_cmd);
+
+    if let Err(e) = run_elevated_command(combined).await {
+        if e.to_lowercase().contains("elevation canceled") || e.to_lowercase().contains("canceled by the user") {
+            return Err("elevation-canceled-by-user".into());
+        }
+        return Err(e);
+    }
+
+    match turn_on_settings_and_app_protection(app_handle) {
+        Ok(_) => Ok(true),
+        Err(e) => Err(format!("failed to turn on protection: {}", e)),
     }
 }
 
@@ -2360,12 +2426,26 @@ fn purge_old_powershell_task(task_name: &str) {
     if let Ok(output) = run_hidden_output("schtasks", &["/Query", "/TN", task_name, "/V", "/FO", "LIST"]) {
         if output.status.success() {
             let txt = String::from_utf8_lossy(&output.stdout).to_lowercase();
-            if txt.contains("task to run:") && txt.contains("powershell.exe") {
+            if txt.contains("task to run:") && (txt.contains("powershell.exe") || txt.contains("wscript.exe")) {
                 let _ = run_hidden_output("schtasks", &["/Delete", "/TN", task_name, "/F"]);
-                println!("purged task '{}' that launched powershell.exe", task_name);
+                println!("purged legacy task '{}' that launched powershell.exe/wscript.exe", task_name);
             }
         }
     }
+}
+
+#[tauri::command]
+fn disable_autostart(app_handle: tauri::AppHandle) -> Result<bool, String> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    match hkcu.open_subkey(RUN_KEY) {
+        Ok(key) => {
+            let _ = key.delete_value(RUN_VALUE_NAME);
+        }
+        Err(_) => {}
+    }
+
+    let _ = save_preference("autoStart".to_string(), serde_json::Value::Bool(false), app_handle);
+    Ok(true)
 }
 
 fn main() {
@@ -2382,6 +2462,8 @@ fn main() {
         .setup(|app| {
             purge_old_powershell_task("EagleElevate");
             let app_handle = app.app_handle();
+            let app_clone = app_handle.clone();
+            enable_autostart(app_clone)?;
             if let Err(e) = reactivate_timers(&app_handle) {
                 eprintln!("reactivate_timers failed during setup: {}", e);
             }
@@ -2452,7 +2534,8 @@ fn main() {
             show_delay_for_priming_deletion,
             close_invoking_window,
             close_confirmation_dialog,
-            get_block_data_for_block_websites
+            get_block_data_for_block_websites,
+            activate_app_and_settings_protection
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

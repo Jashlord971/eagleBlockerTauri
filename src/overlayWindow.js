@@ -6,8 +6,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     initializeCloseButton();
     setUpAppInfo();
     hideElement('hidden');
-    setUpAltCloseButton();
 });
+
+function hideButton(){
+    const closeButton = document.getElementById('closeBtn');
+    if (closeButton) closeButton.style.display = 'none';
+
+    showElement('hidden');
+    const alt = document.getElementById('altButton');
+    if (alt) alt.style.display = 'inline-block';
+}
 
 function setUpAppInfo(){
     const params = new URLSearchParams(window.location.search);
@@ -26,64 +34,41 @@ function setUpAppInfo(){
     const processFile = processNameLower.split('\\').pop().split('/').pop();
 
     const code = appInfo.code || '';
+    const paragraph = document.getElementById('warning-paragraph');
 
     if (code === 'protected-system-app') {
-        const paragraph = document.getElementById('warning-paragraph');
-        if (paragraph) {
-            paragraph.textContent =
+        paragraph.textContent =
                 "We noticed a protected system app is open (Task Manager, Task Scheduler, or Control Panel). " +
                 "Please close that window from the taskbar to allow this overlay to close automatically.";
-        }
 
-        const closeButton = document.getElementById('closeBtn');
-        if (closeButton) closeButton.style.display = 'none';
-
-        showElement('hidden');
-        const alt = document.getElementById('altButton');
-        if (alt) alt.style.display = 'inline-block';
+        hideButton();
     }
     else if(code === 'browser-with-proxy'){
-        const paragraph = document.getElementById('warning-paragraph'); 
-        if (paragraph) {
-            paragraph.textContent =
+        paragraph.textContent =
                 "We noticed a browser application running while TOR, a VPN, or Proxy is active on your system. " +
                 "For your safety, please close the browser to allow this overlay to close automatically.";
-        }
-
-        const closeButton = document.getElementById('closeBtn');
-        if (closeButton) closeButton.style.display = 'none';
-
-        showElement('hidden');
-        const alt = document.getElementById('altButton');
-        if (alt) alt.style.display = 'inline-block';
+        hideButton();
     }
     else if(code === "uninstaller-window-detected"){
-        const paragraph = document.getElementById('warning-paragraph');
-        if (paragraph) {
-            paragraph.textContent =
+        paragraph.textContent =
                 "We detected that the Eagle Blocker uninstaller window is open. " +
                 "Please close the uninstaller window to allow this overlay to close automatically.";
-        }
 
-        const closeButton = document.getElementById('closeBtn');
-        if (closeButton) closeButton.style.display = 'none';
-
-        showElement('hidden');
-        const alt = document.getElementById('altButton');
-        if (alt) alt.style.display = 'inline-block';
+        hideButton();
+    }
+    else if(code == "unsupported_browser"){
+        paragraph.textContent =
+                "We detected that you are using an unsupported browser. " +
+                "Please close the browser to allow this overlay to close automatically.";
+    }
+    else if(code === "browser-with-vpn"){
+        paragraph.textContent =
+                "We noticed a supported browser with a vpn extension running. " +
+                "For your safety, please close the browser to allow this overlay to close automatically.";
     }
 
     const isSystem = code === 'protected-system-app';
     console.log('overlay appInfo:', appInfo, { processFile, isSystem });
-}
-
-function setUpAltCloseButton() {
-    const altButton = document.getElementById("altButton");
-    if (!altButton) return;
-
-    altButton.addEventListener("click", () => {
-        closeOverlay();
-    });
 }
 
 function showElement(id) {
@@ -111,14 +96,7 @@ function initializeCloseButton(){
     }
 
     closeButton.addEventListener('click', () => {
-        invoke('close_app', { processName: appInfo.processName })
-            .then(result => {
-                console.log("should close the overlay window");
-                if(result){
-                    closeOverlay();
-                }
-            })
-            .catch(err => console.error('close_app error', err));
+        invoke('close_app', { processName: appInfo.processName });
 
         const loadingIcon = document.getElementById('loading');
         if(loadingIcon){

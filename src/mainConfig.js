@@ -169,18 +169,20 @@ async function initializeSettingsAndAppProtection(){
     const key = 'blockSettingsSwitch';
     const settingsAndAppProtectionSwitch = document.getElementById(key);
 
+    invoke('activate_app_and_settings_protection');
     if(!settingsAndAppProtectionSwitch){
         return;
     }
 
-    const isChecked = await getPreference(key);
+    //const isChecked = await getPreference(key);
+    const isChecked = false;
     if(isChecked){
-        invoke('turn_on_settings_and_app_protection');
+        invoke('activate_app_and_settings_protection');
     } else{
         invoke('stop_settings_and_app_protection');
     }
-
     settingsAndAppProtectionSwitch.checked = isChecked;
+    settingsAndAppProtectionSwitch.checked = false;
 
     settingsAndAppProtectionSwitch.addEventListener('change', async () => {
         const isSettingsProtectionActive = await getPreference(key);
@@ -189,7 +191,8 @@ async function initializeSettingsAndAppProtection(){
             openConfirmationDialog(key);
         }
         else{
-            saveSharedPreference(key);
+            invoke('activate_app_and_settings_protection');
+            //saveSharedPreference(key);
         }
     });
 }
