@@ -3,7 +3,6 @@ use std::net::{TcpStream, SocketAddr};
 use std::time::Duration;
 use std::path::Path;
 use winreg::{RegKey, enums::*};
-use std::process::Command;
 
 pub struct BrowserDetector {
     pub known_browsers: HashSet<String>,

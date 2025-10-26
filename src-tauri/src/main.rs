@@ -28,6 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use once_cell::sync::Lazy;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::mpsc;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -44,8 +45,7 @@ static OVERLAY_OPEN: Lazy<std::sync::atomic::AtomicBool> = Lazy::new(|| std::syn
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const DELAY_TIMEOUT_KEY: &str = "delayTimeOutAtTimeOfChange";
 
-static DNS_SAFE_CACHE: Lazy<Mutex<Option<(bool, std::time::Instant)>>> =
-    Lazy::new(|| Mutex::new(None));
+static DNS_SAFE_CACHE: Lazy<Mutex<Option<(bool, std::time::Instant)>>> =Lazy::new(|| Mutex::new(None));
 const DNS_SAFE_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 
 pub(crate) fn run_hidden_output(program: &str, args: &[&str]) -> Result<std::process::Output, String> {
@@ -523,9 +523,73 @@ async fn enable_safe_search(app_handle: tauri::AppHandle) -> Result<bool, String
     Ok(true)
 }
 
+static WINDOW_TITLE_SCRIPT: Lazy<String> = Lazy::new(|| {
+    r#"
+Add-Type @"
+    using System;
+    using System.Runtime.InteropServices;
+    using System.Text;
+    public class Win32 {
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")]
+        public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+    }
+"@
+$hwnd = [Win32]::GetForegroundWindow()
+$title = New-Object System.Text.StringBuilder 256
+[Win32]::GetWindowText($hwnd, $title, 256)
+$title.ToString()
+"#.to_string()
+});
+
+fn get_active_window_title_fast() -> Result<String, String> {
+    let output = run_hidden_output("powershell", &[
+        "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", 
+        "-Command", &WINDOW_TITLE_SCRIPT
+    ]).map_err(|e| format!("powershell spawn failed: {}", e))?;
+
+    if output.status.success() {
+        let title = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(title)
+    } else {
+        Err("Failed to get active window title".into())
+    }
+}
+
+fn check_active_window_for_flags() -> Result<bool, String> {
+    let start_time = std::time::Instant::now();
+    
+    let flagged_titles = [
+        "eagleblocker uninstall",
+        "task manager",
+        "task scheduler", 
+        "apps & features"
+    ];
+
+    let title = get_active_window_title_fast()?;
+    let title_lower = title.to_lowercase();
+    
+    for flagged in &flagged_titles {
+        if title_lower.contains(flagged) {
+            let duration = start_time.elapsed();
+            println!("check_active_window_for_flags: found flagged title '{}' contains '{}' in {:?}", title, flagged, duration);
+            return Ok(true);
+        }
+    }
+    
+    let duration = start_time.elapsed();
+    println!("check_active_window_for_flags: completed in {:?} (no flagged titles found)", duration);
+    Ok(false)
+}
+
 fn get_running_process_names() -> Result<HashSet<String>, String> {
-    let output = run_hidden_output("tasklist", &["/FO", "CSV", "/NH"]) 
+    let start_time = std::time::Instant::now();
+    
+    // Remove /V flag - much faster!
+    let output = run_hidden_output("tasklist", &["/FO", "CSV", "/NH"])
         .map_err(|e| format!("tasklist spawn failed: {}", e))?;
+
     if !output.status.success() {
         return Err("tasklist failed".into());
     }
@@ -534,14 +598,19 @@ fn get_running_process_names() -> Result<HashSet<String>, String> {
     let mut set = HashSet::new();
 
     for line in stdout.lines() {
-        if let Some(name_field) = line.split(',').next() {
-            let name = name_field.trim().trim_matches('"').to_lowercase();
-            if !name.is_empty() { 
-                set.insert(name); 
+        if line.trim().is_empty() { continue; }
+        
+        let fields = parse_csv_line(line);
+        if !fields.is_empty() {
+            let process_name = fields[0].trim_matches('"').to_lowercase();
+            if !process_name.is_empty() {
+                set.insert(process_name);
             }
         }
     }
 
+    let duration = start_time.elapsed();
+    println!("get_running_process_names: completed in {:?} ({} processes)", duration, set.len());
     Ok(set)
 }
 
@@ -618,25 +687,64 @@ fn is_embedded_webview(process_name: &str) -> bool {
     p.contains("msedgewebview2") || p.contains("webview2") || p.contains("bravecrashhandler")
 }
 
-fn is_uninstall_window_title_visible() -> Result<bool, String> {
-    let query = "eagleblocker Uninstall";
+fn has_any_of_flagged_titles() -> Result<bool, String> {
+    let start_time = std::time::Instant::now();
+    
+    let flagged_titles = [
+        "eagleblocker uninstall",
+        "task manager",
+        "task scheduler", 
+        "apps & features"
+    ];
+
     let output = run_hidden_output("tasklist", &["/FO", "CSV", "/NH", "/V"])
         .map_err(|e| format!("tasklist /V spawn failed: {}", e))?;
+    
     if !output.status.success() {
+        let duration = start_time.elapsed();
+        println!("has_any_of_flagged_titles: completed in {:?} (tasklist failed)", duration);
         return Ok(false);
     }
+    
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let needle = query.to_lowercase();
+    
     for line in stdout.lines() {
         if line.trim().is_empty() { continue; }
         let cols = parse_csv_line(line);
         if cols.is_empty() { continue; }
+        
         let window_title = cols.last().map(|s| s.trim_matches('"')).unwrap_or("");
-        if !window_title.is_empty() && window_title.to_lowercase().contains(&needle) {
-            return Ok(true);
+        if window_title.is_empty() { continue; }
+        
+        let title_lower = window_title.to_lowercase();
+        
+        for flagged in &flagged_titles {
+            if title_lower.contains(flagged) {
+                let duration = start_time.elapsed();
+                println!("has_any_of_flagged_titles: found flagged title '{}' contains '{}' in {:?}", window_title, flagged, duration);
+                return Ok(true);
+            }
         }
     }
+    
+    let duration = start_time.elapsed();
+    println!("has_any_of_flagged_titles: completed in {:?} (no flagged titles found)", duration);
     Ok(false)
+}
+
+fn should_flag_window_title(title: &str) -> bool {
+    let title_lower = title.to_lowercase();
+    let flagged_titles = [
+        "task manager", 
+        "task scheduler", 
+        "control panel", 
+        "registry editor", 
+        "hosts",
+        "eagleblocker uninstall", 
+        "apps & features" 
+    ];
+    
+    flagged_titles.iter().any(|flagged| title_lower.contains(flagged))
 }
 
 #[cfg(windows)]
@@ -667,204 +775,256 @@ fn is_pc_idle(threshold_ms: u64) -> Result<bool, String> {
     }
 }
 
+fn flag_protected_apps(app_handle: tauri::AppHandle, running: HashSet<String>) -> Result<bool, String> {
+    for (display, procs) in PROTECTED_SYSTEM_APPS.iter() {
+        if procs.iter().any(|p| running.contains(*p)) {
+            let arguments = serde_json::json!({
+                "displayName": display,
+                "processName": procs[0],
+                "code" : "protected-system-app"
+            });
+
+            let _ = show_overlay(&app_handle, arguments);
+            return Ok(true);
+        }
+    }
+    
+    Ok(false)
+}
+
+fn flag_blocked_apps(app_clone: tauri::AppHandle, running: HashSet<String>) -> Result<bool, String> {
+    if let Ok(block_map) = load_block_data(&app_clone) {
+        let blocked_apps = collect_blocked_apps(&block_map);
+        for (proc_name, display_name) in blocked_apps.iter() {
+            if process_matches_running(proc_name, &running) {
+                let arguments = serde_json::json!({
+                    "displayName": display_name,
+                    "processName": proc_name,
+                    "code" : "blocked-app"
+                });
+                let _ = show_overlay(&app_clone, arguments);
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn flag_proxies_and_dns_bypassers(app_clone: tauri::AppHandle, running: HashSet<String>) -> Result<bool, String> {
+    if BROWSER_DETECTOR.is_tor_proxy_running_enhanced() {
+        for process_name in running.iter() {
+            if BROWSER_DETECTOR.is_browser_application(process_name) && !is_embedded_webview(process_name) {
+                let arguments = serde_json::json!({
+                    "displayName": process_name,
+                    "processName": process_name,
+                    "code" : "browser-with-proxy"
+                });
+
+                let _ = show_overlay(&app_clone, arguments);
+                return Ok(true);
+            }
+        }
+    }
+
+    let browser_process_names = BROWSER_DETECTOR.known_browsers.iter()
+        .map(|b| b.to_lowercase())
+        .filter(|p| p != "brave.exe" && p != "chrome.exe" && p != "msedge.exe")
+        .collect::<HashSet<String>>();
+
+    for process_name in browser_process_names.iter() {
+        if running.contains(process_name) {
+            let arguments = serde_json::json!({
+                "displayName": process_name,
+                "processName": process_name,
+                "code" : "unsupported_browser"
+            });
+
+            let _ = show_overlay(&app_clone, arguments);
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn is_supported_browser_running(running: HashSet<String>) -> Result<bool, String> {
+    let result = running.contains(&"brave.exe".to_string()) || running.contains(&"chrome.exe".to_string()) || running.contains(&"msedge.exe".to_string());
+    Ok(result)
+}
+
+fn flag_supported_browser_with_vpn_extension(app_clone: tauri::AppHandle, running: HashSet<String>, extensions: Vec<serde_json::Value>) -> Result<bool, String> {
+    let mut browsers: HashSet<String> = HashSet::new();
+
+    for ext in extensions.iter() {
+        let is_vpn = ext.get("is_vpn").and_then(|v| v.as_bool()).unwrap_or(false);
+        let has_proxy = ext.get("has_proxy_permission").and_then(|v| v.as_bool()).unwrap_or(false);
+        if is_vpn && has_proxy {
+            if let Some(bname) = ext.get("browser").and_then(|v| v.as_str()) {
+                browsers.insert(bname.to_string());
+            }
+        }
+    }
+
+    let map_proc = |b: &str| -> Option<(&'static str, &'static str)> {
+        match b {
+            "Chrome" => Some(("Google Chrome", "chrome.exe")),
+            "Edge" => Some(("Microsoft Edge", "msedge.exe")),
+            "Brave" => Some(("Brave", "brave.exe")),
+            _ => None,
+        }
+    };
+
+    for b in browsers {
+        if let Some((display, exe)) = map_proc(&b) {
+            if running.contains(&exe.to_lowercase()) {
+                let _ = show_overlay(
+                    &app_clone,
+                    serde_json::json!({
+                        "displayName": display,
+                        "processName": exe,
+                        "code": "browser-with-vpn"
+                    }),
+                );
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+fn flag_vpn_proxy(app_clone: tauri::AppHandle, running: HashSet<String>) -> Result<bool, String> {
+    match detect_vpn_proxy_all_browsers() {
+        Ok(extensions) => {
+            if !extensions.is_empty() {
+                let result = flag_supported_browser_with_vpn_extension(app_clone.clone(), 
+                running.clone(), extensions).unwrap_or(false);
+                return Ok(result);
+            }
+        }
+        Err(e) => {
+            eprintln!("VPN detection thread: detection failed: {}", e);
+        }
+    }
+    Ok(false)
+}
+
 #[tauri::command]
 fn turn_on_settings_and_app_protection(app_handle: tauri::AppHandle) -> Result<bool, String> {
+    let start_time = std::time::Instant::now();
+    
     let mut guard = PROTECTION_HANDLE.lock().map_err(|e| e.to_string())?;
     if guard.is_some() {
+        let duration = start_time.elapsed();
+        println!("turn_on_settings_and_app_protection: completed in {:?} (already running)", duration);
         return Ok(true);
     }
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     *PROTECTION_STOP.lock().map_err(|e| e.to_string())? = Some(stop_flag.clone());
 
+    let is_settings_protection_on = read_preferences_for_key(&app_handle.clone(), "blockSettingsSwitch").unwrap_or(false);
+
+    if !is_settings_protection_on {
+        let duration = start_time.elapsed();
+        println!("turn_on_settings_and_app_protection: completed in {:?} (protection disabled)", duration);
+        return Ok(false);
+    }
+
     let app_clone = app_handle.clone();
     let handle = std::thread::spawn(move || {
-        let interval = Duration::from_secs(4);
+        let interval = Duration::from_secs(2);
         let sync_interval = Duration::from_secs(90);
         let mut last_sync = std::time::Instant::now();
+        
         loop {
+            let loop_start_time = std::time::Instant::now();
+            
             if stop_flag.load(Ordering::SeqCst) {
+                println!("turn_on_settings_and_app_protection: protection loop stopped");
                 break;
             }
 
+            /*
             if is_pc_idle(2 * 60 * 1000).unwrap_or(false) {
+                println!("Pc is idle, sleeping:");
                 std::thread::sleep(interval);
                 continue;
             }
+             */
 
             if last_sync.elapsed() >= sync_interval {
+                let sync_start = std::time::Instant::now();
                 if let Err(e) = perform_sync_recovery(&app_clone) {
                     eprintln!("protection thread: sync/recovery failed: {}", e);
                 }
+                let sync_duration = sync_start.elapsed();
+                println!("turn_on_settings_and_app_protection: sync/recovery completed in {:?}", sync_duration);
                 last_sync = std::time::Instant::now();
-            }
-            
-            let is_settings_protection_on = read_preferences_for_key(&app_clone, "blockSettingsSwitch").unwrap_or(false);
-
-            if !is_settings_protection_on {
-                break;
             }
 
             let is_dns_protection_on = read_preferences_for_key(&app_clone, "enableProtectiveDNS").unwrap_or(false);
 
-            if is_settings_protection_on {
-                let mut has_flagged = false;
-                if has_flagged == false {
-                    if is_uninstall_window_title_visible().unwrap_or(false) {
-                        let arguments = serde_json::json!({
-                            "displayName": UNINSTALL_OVERLAY_DISPLAY,
-                            "processName": "uninstaller",
-                            "code" : "uninstaller-window-detected"
-                        });
-                        let _ = show_overlay(&app_clone, arguments);
-                        has_flagged = true;
-                    }
+            let mut has_flagged = false;
+            
+            if !has_flagged {
+                let titles_start = std::time::Instant::now();
+                if check_active_window_for_flags().unwrap_or(false) {
+                    let arguments = serde_json::json!({
+                        "displayName": UNINSTALL_OVERLAY_DISPLAY,
+                        "processName": "uninstaller",
+                        "code" : "uninstaller-window-detected"
+                    });
+                    let _ = show_overlay(&app_clone, arguments);
+                    has_flagged = true;
                 }
-
-                if !has_flagged {
-                    match get_running_process_names() {
-                        Ok(running) => {
-                            for (display, procs) in PROTECTED_SYSTEM_APPS.iter() {
-                                if procs.iter().any(|p| running.contains(*p)) {
-                                    let arguments = serde_json::json!({
-                                        "displayName": display,
-                                        "processName": procs[0],
-                                        "code" : "protected-system-app"
-                                    });
-
-                                    let _ = show_overlay(&app_clone, arguments);
-                                    has_flagged = true;
-                                    break;
-                                }
-                            }
-
-                            if has_flagged == false {
-                                if let Ok(block_map) = load_block_data(&app_clone) {
-                                    let blocked_apps = collect_blocked_apps(&block_map);
-                                    for (proc_name, display_name) in blocked_apps.iter() {
-                                        if process_matches_running(proc_name, &running) {
-                                            let arguments = serde_json::json!({
-                                                "displayName": display_name,
-                                                "processName": proc_name,
-                                                "code" : "blocked-app"
-                                            });
-                                            let _ = show_overlay(&app_clone, arguments);
-                                            has_flagged = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            
-                            if has_flagged == false && is_dns_protection_on {
-                                if BROWSER_DETECTOR.is_tor_proxy_running_enhanced() {
-                                    for process_name in running.iter() {
-                                        if BROWSER_DETECTOR.is_browser_application(process_name) && !is_embedded_webview(process_name) {
-                                            let arguments = serde_json::json!({
-                                                "displayName": process_name,
-                                                "processName": process_name,
-                                                "code" : "browser-with-proxy"
-                                            });
-
-                                            let _ = show_overlay(&app_clone, arguments);
-
-                                            has_flagged = true;
-                                            println!("Found a registered browser running while the tor connection is on. Flagged!");
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                if has_flagged == false {
-                                    let browser_process_names = BROWSER_DETECTOR.known_browsers.iter()
-                                        .map(|b| b.to_lowercase())
-                                        .filter(|p| p != "brave.exe" && p != "chrome.exe" && p != "msedge.exe")
-                                        .collect::<HashSet<String>>();
-
-                                    for process_name in browser_process_names.iter() {
-                                        if running.contains(process_name) {
-                                            let arguments = serde_json::json!({
-                                                "displayName": process_name,
-                                                "processName": process_name,
-                                                "code" : "unsupported_browser"
-                                            });
-
-                                            let _ = show_overlay(&app_clone, arguments);
-
-                                            has_flagged = true;
-                                            println!("Found a registered browser running while the tor connection is on. Flagged!");
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-
-                            if running.contains(&"brave.exe".to_string()) || running.contains(&"chrome.exe".to_string()) || running.contains(&"msedge.exe".to_string()) {
-                                match detect_vpn_proxy_all_browsers() {
-                                    Ok(extensions) => {
-                                        if !extensions.is_empty() {
-                                            let mut browsers: HashSet<String> = HashSet::new();
-                                            for ext in extensions.iter() {
-                                                let is_vpn = ext.get("is_vpn").and_then(|v| v.as_bool()).unwrap_or(false);
-                                                let has_proxy = ext.get("has_proxy_permission").and_then(|v| v.as_bool()).unwrap_or(false);
-                                                if is_vpn && has_proxy {
-                                                    if let Some(bname) = ext.get("browser").and_then(|v| v.as_str()) {
-                                                        browsers.insert(bname.to_string());
-                                                    }
-                                                }
-                                            }
-
-                                            let map_proc = |b: &str| -> Option<(&'static str, &'static str)> {
-                                                match b {
-                                                    "Chrome" => Some(("Google Chrome", "chrome.exe")),
-                                                    "Edge" => Some(("Microsoft Edge", "msedge.exe")),
-                                                    "Brave" => Some(("Brave", "brave.exe")),
-                                                    _ => None,
-                                                }
-                                            };
-
-                                            let mut blocked = false;
-                                            for b in browsers {
-                                                if let Some((display, exe)) = map_proc(&b) {
-                                                    if running.contains(&exe.to_lowercase()) {
-                                                        let _ = show_overlay(
-                                                            &app_clone,
-                                                            serde_json::json!({
-                                                                "displayName": display,
-                                                                "processName": exe,
-                                                                "code": "browser-with-vpn"
-                                                            }),
-                                                        );
-                                                        has_flagged = true;
-                                                        blocked = true;
-                                                        break;
-                                                    }
-                                                }
-                                            }
-
-                                            if !blocked {
-                                                println!("VPN extensions present, but none of the affected browsers are currently running.");
-                                            }
-                                        } else {
-                                            println!("✅ No VPN proxy extensions detected");
-                                        }
-                                    }
-                                    Err(e) => {
-                                        eprintln!("VPN detection thread: detection failed: {}", e);
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => eprintln!("protection thread: get_running_process_names failed: {}", e),
-                    }
-                }
-
-                if has_flagged == false {
-                    close_overlay_window(app_clone.clone());
+                let titles_duration = titles_start.elapsed();
+                if titles_duration > Duration::from_millis(100) {
+                    println!("turn_on_settings_and_app_protection: flagged titles check took {:?}", titles_duration);
                 }
             }
-            else{
-                return;
+
+            if !has_flagged {
+                let processes_start = std::time::Instant::now();
+                match get_running_process_names() {
+                    Ok(running) => {
+                        let process_check_start = std::time::Instant::now();
+                        has_flagged = flag_protected_apps(app_clone.clone(), running.clone()).unwrap_or(false);
+
+                        if !has_flagged {
+                            has_flagged = flag_blocked_apps(app_clone.clone(), running.clone()).unwrap_or(false);
+                        }
+                        
+                        /*
+                        if !has_flagged && is_dns_protection_on {
+                            has_flagged = flag_proxies_and_dns_bypassers(app_clone.clone(), running.clone()).unwrap_or(false);
+                        }
+                        
+                        if !has_flagged && is_supported_browser_running(running.clone()).unwrap_or(false) {
+                            has_flagged = flag_vpn_proxy(app_clone.clone(), running.clone()).unwrap_or(false);
+                        }
+                         */
+                        
+                        let process_check_duration = process_check_start.elapsed();
+                        if process_check_duration > Duration::from_millis(50) {
+                            println!("turn_on_settings_and_app_protection: process checks took {:?}", process_check_duration);
+                        }
+                    }
+                    Err(e) => eprintln!("protection thread: getting the running processes call failed: {}", e),
+                }
+                let processes_duration = processes_start.elapsed();
+                if processes_duration > Duration::from_millis(200) {
+                    println!("turn_on_settings_and_app_protection: get_running_process_names took {:?}", processes_duration);
+                }
+            }
+
+            if has_flagged == false {
+                close_overlay_window(app_clone.clone());
+            }
+
+            let loop_duration = loop_start_time.elapsed();
+            if loop_duration > Duration::from_millis(500) {
+                println!("turn_on_settings_and_app_protection: protection loop iteration took {:?}", loop_duration);
             }
 
             std::thread::sleep(interval);
@@ -873,7 +1033,13 @@ fn turn_on_settings_and_app_protection(app_handle: tauri::AppHandle) -> Result<b
 
     *guard = Some(handle);
     
-    let _ = create_eagle_task_schedule_simple();
+    let task_start = std::time::Instant::now();
+    let _ = create_eagle_recurring_task();
+    let task_duration = task_start.elapsed();
+    
+    let total_duration = start_time.elapsed();
+    println!("turn_on_settings_and_app_protection: completed in {:?} (task creation: {:?})", total_duration, task_duration);
+    
     Ok(true)
 }
 
@@ -1156,9 +1322,7 @@ fn perform_sync_recovery(app_handle: &tauri::AppHandle) -> Result<(), String> {
     std::thread::spawn(move || {
         println!("perform_sync_recovery: starting sync/recovery check");
         let res: Result<(), String> = (|| {
-            if let Err(_) = check_task_schedule_exists() {
-                let _ = create_eagle_task_schedule_simple();
-            }
+            let _= create_eagle_recurring_task();
 
             let block_path = get_app_file_path(&app_handle, "blockData.json")?;
             if !block_path.exists() || is_file_corrupted(&block_path) {
@@ -1301,7 +1465,7 @@ fn enable_autostart(app_handle: tauri::AppHandle) -> Result<bool, String> {
 
 #[tauri::command]
 fn stop_settings_and_app_protection() -> Result<bool, String> {
-    let _ = remove_eagle_task_schedule_simple();
+    let _ = delete_all_eagle_tasks();
     if let Some(flag) = PROTECTION_STOP.lock().map_err(|e| e.to_string())?.take() {
         flag.store(true, Ordering::SeqCst);
     }
@@ -1319,27 +1483,12 @@ fn read_preferences_for_key(app_handle: &tauri::AppHandle, key: &str) -> Result<
 }
 
 #[tauri::command]
-fn close_app(app_handle: tauri::AppHandle, process_name: String) -> Result<bool, String> {
+fn close_app(process_name: String) -> Result<bool, String> {
     std::thread::spawn(move || {
         let base = process_name.trim().trim_end_matches(".exe").to_string();
         let target_exe = format!("{}.exe", base);
         let _ = run_hidden_output("taskkill", &["/F", "/IM", &target_exe]);
-        let start = std::time::Instant::now();
-        let mut success = false;
-        while start.elapsed() < std::time::Duration::from_secs(60) {
-            match get_running_process_names() {
-                Ok(set) => {
-                    if !set.contains(&target_exe.to_lowercase()) && !set.contains(&base.to_lowercase()) {
-                        success = true;
-                        break;
-                    }
-                }
-                Err(_) =>  {}
-            }
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        }
     });
-
     Ok(true)
 }
 
@@ -2232,39 +2381,35 @@ sh.Run """" & "{exe}" & """", 0, False
     Ok(vbs)
 }
 
-fn create_eagle_task_schedule_simple() -> Result<bool, String> {
-    /*
-    if let Ok(q) = run_hidden_output("schtasks", &["/Query", "/TN", TASK_NAME]) {
+fn create_eagle_recurring_task() -> Result<bool, String> {
+    let task_name = "Eagle Recurring Start";
+    if let Ok(q) = run_hidden_output("schtasks", &["/Query", "/TN", &task_name]) {
         if q.status.success() {
-            println!("Returning early");
+            println!("Eagle Recurring Start task already exists, returning early");
             return Ok(true);
         }
     }
-    */
 
     let exe_path = resolve_prod_exe_path()?;
-    println!("exe_path: {}", exe_path.clone());
     let tr_value = format!(r#""{}""#, exe_path.replace('"', "\\\""));
-
-    purge_old_powershell_task(TASK_NAME);
 
     let args = [
         "/Create", "/F",
         "/SC", "MINUTE",
         "/MO", "1",
-        "/TN", TASK_NAME,
+        "/TN", task_name,
         "/TR", &tr_value,
     ];
 
     let output = run_hidden_output("schtasks", &args).map_err(|e| format!("failed to spawn schtasks: {}", e))?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
+    
     if output.status.success() {
-        println!("Successfully set the task schedule");
+        println!("Successfully created recurring task schedule");
         Ok(true)
     } else {
-        Err(format!("schtasks failed: code={:?}, stdout={}, stderr={}", output.status.code(), stdout, stderr))
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("recurring task creation failed: code={:?}, stdout={}, stderr={}", output.status.code(), stdout, stderr))
     }
 }
 
@@ -2281,16 +2426,12 @@ async fn activate_app_and_settings_protection(app_handle: tauri::AppHandle) -> R
         tr = exe_quoted
     );
 
-    println!("schtasks_cmd: {}", schtasks_cmd);
-
     let reg_cmd = format!(
         r#"reg add "{runkey}" /v "{valname}" /t REG_SZ /d {tr} /f"#,
         runkey = RUN_KEY_ALL_USERS,
         valname = RUN_VALUE_NAME,
         tr = exe_quoted
     );
-
-    println!("reg_cmd: {}", reg_cmd);
 
     let combined = format!(r#"{schtasks} && {reg}"#, schtasks = schtasks_cmd, reg = reg_cmd);
 
@@ -2302,26 +2443,56 @@ async fn activate_app_and_settings_protection(app_handle: tauri::AppHandle) -> R
     }
 
     match turn_on_settings_and_app_protection(app_handle) {
-        Ok(_) => Ok(true),
+        Ok(_) => {
+            let _= create_eagle_recurring_task();
+            Ok(true)
+        },
         Err(e) => Err(format!("failed to turn on protection: {}", e)),
     }
 }
 
 fn remove_eagle_task_schedule_simple() -> Result<bool, String> {
-    let args = ["/Delete", "/TN", TASK_NAME, "/F"];
-    println!("remove_eagle_task_schedule_simple: running: schtasks {}", args.join(" "));
+    delete_all_eagle_tasks()
+}
+
+fn delete_eagle_task_schedule(task_name: &str) -> Result<bool, String> {
+    println!("delete_eagle_task_schedule: attempting to delete task '{}'", task_name);
+    
+    let args = ["/Delete", "/TN", task_name, "/F"];
     let output = run_hidden_output("schtasks", &args)
-        .map_err(|e| format!("failed to spawn schtasks: {}", e))?;
+        .map_err(|e| format!("failed to spawn schtasks delete: {}", e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     if output.status.success() {
-        println!("remove_eagle_task_schedule_simple: succeeded: {}", stdout);
+        println!("delete_eagle_task_schedule: successfully deleted task '{}'", task_name);
         Ok(true)
     } else {
-        Err(format!("schtasks delete failed: code={:?}, stdout={}, stderr={}", output.status.code(), stdout, stderr))
+        if stderr.to_lowercase().contains("cannot find") || stderr.to_lowercase().contains("not found") {
+            println!("delete_eagle_task_schedule: task '{}' not found (already deleted)", task_name);
+            Ok(true)
+        } else {
+            Err(format!("schtasks delete failed for '{}': code={:?}, stdout={}, stderr={}", 
+                task_name, output.status.code(), stdout, stderr))
+        }
     }
+}
+
+fn delete_all_eagle_tasks() -> Result<bool, String> {
+    let task_names = ["Eagle Task Schedule", "Eagle Recurring Start"];
+    let mut count_deleted_success = 0;
+    
+    for task_name in &task_names {
+        match delete_eagle_task_schedule(task_name) {
+            Ok(_) => {
+                count_deleted_success = count_deleted_success + 1
+            },
+            Err(e) => eprintln!("delete_all_eagle_tasks: failed to delete '{}': {}", task_name, e),
+        }
+    }
+    
+    Ok(count_deleted_success == task_names.len())
 }
 
 fn register_page_change_menu_handler(app: &tauri::App) {
@@ -2461,20 +2632,6 @@ fn get_user_specific_lock_port() -> Result<String, String> {
     Ok(format!("127.0.0.1:{}", port))
 }
 
-#[tauri::command]
-fn disable_autostart(app_handle: tauri::AppHandle) -> Result<bool, String> {
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    match hkcu.open_subkey(RUN_KEY) {
-        Ok(key) => {
-            let _ = key.delete_value(RUN_VALUE_NAME);
-        }
-        Err(_) => {}
-    }
-
-    let _ = save_preference("autoStart".to_string(), serde_json::Value::Bool(false), app_handle);
-    Ok(true)
-}
-
 fn main() {
     let lock_addr = match get_user_specific_lock_port() {
         Ok(addr) => addr,
@@ -2578,4 +2735,3 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
-
