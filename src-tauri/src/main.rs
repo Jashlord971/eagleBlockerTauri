@@ -59,15 +59,27 @@ pub(crate) fn run_hidden_output(program: &str, args: &[&str]) -> Result<std::pro
 }
 
 static FILE_IO_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
-
 static ACTIVE_TIMERS: Lazy<Mutex<HashMap<String, (Arc<AtomicBool>, std::thread::JoinHandle<()>, u64)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
-
 static PROTECTION_HANDLE: Lazy<Mutex<Option<thread::JoinHandle<()>>>> = Lazy::new(|| Mutex::new(None));
 static PROTECTION_STOP: Lazy<Mutex<Option<Arc<AtomicBool>>>> = Lazy::new(|| Mutex::new(None));
 static CURRENT_PAGE: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
 static BLOCK_DATA_CACHE: Lazy<Mutex<Option<Map<String, Value>>>> = Lazy::new(|| Mutex::new(None));
 static SAVED_PREFERENCES_CACHE: Lazy<Mutex<Option<Map<String, Value>>>> = Lazy::new(|| Mutex::new(None));
+static UNSUPPORTED_BROWSER_PROCS: Lazy<HashSet<String>> = Lazy::new(|| {
+    BROWSER_DETECTOR
+        .known_browsers
+        .iter()
+        .map(|b| b.to_lowercase())
+        .filter(|p| p != "chrome.exe" && p != "msedge.exe")
+        .collect::<HashSet<String>>()
+});
+
+static VPN_EXT_CACHE: Lazy<Mutex<Option<(Vec<serde_json::Value>, std::time::Instant)>>> = Lazy::new(|| Mutex::new(None));
+const VPN_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(45);
+
+static VPN_WORKER_HANDLE: Lazy<Mutex<Option<std::thread::JoinHandle<()>>>> = Lazy::new(|| Mutex::new(None));
+static VPN_WORKER_STOP: Lazy<Mutex<Option<Arc<AtomicBool>>>> = Lazy::new(|| Mutex::new(None));
 
 const REQUIRED_ENTRIES : [&str; 7]= [
     "216.239.38.120 www.google.com",
@@ -342,7 +354,7 @@ async fn turn_on_dns(is_strict: bool, app_handle: tauri::AppHandle) -> Result<()
 
     let _ = tauri::Manager::emit_all(
         &app_handle,
-        "main-config-updated",
+        "preferences-updated",
         serde_json::json!({}),
     );
 
@@ -811,28 +823,8 @@ fn flag_blocked_apps(app_clone: tauri::AppHandle, running: HashSet<String>) -> R
 }
 
 fn flag_proxies_and_dns_bypassers(app_clone: tauri::AppHandle, running: HashSet<String>) -> Result<bool, String> {
-    if BROWSER_DETECTOR.is_tor_proxy_running_enhanced() {
-        for process_name in running.iter() {
-            if BROWSER_DETECTOR.is_browser_application(process_name) && !is_embedded_webview(process_name) {
-                let arguments = serde_json::json!({
-                    "displayName": process_name,
-                    "processName": process_name,
-                    "code" : "browser-with-proxy"
-                });
-
-                let _ = show_overlay(&app_clone, arguments);
-                return Ok(true);
-            }
-        }
-    }
-
-    let browser_process_names = BROWSER_DETECTOR.known_browsers.iter()
-        .map(|b| b.to_lowercase())
-        .filter(|p| p != "brave.exe" && p != "chrome.exe" && p != "msedge.exe")
-        .collect::<HashSet<String>>();
-
-    for process_name in browser_process_names.iter() {
-        if running.contains(process_name) {
+    for process_name in UNSUPPORTED_BROWSER_PROCS.iter() {
+        if running.contains(process_name) && !is_embedded_webview(process_name) {
             let arguments = serde_json::json!({
                 "displayName": process_name,
                 "processName": process_name,
@@ -869,7 +861,6 @@ fn flag_supported_browser_with_vpn_extension(app_clone: tauri::AppHandle, runnin
         match b {
             "Chrome" => Some(("Google Chrome", "chrome.exe")),
             "Edge" => Some(("Microsoft Edge", "msedge.exe")),
-            "Brave" => Some(("Brave", "brave.exe")),
             _ => None,
         }
     };
@@ -893,20 +884,83 @@ fn flag_supported_browser_with_vpn_extension(app_clone: tauri::AppHandle, runnin
     Ok(false)
 }
 
-fn flag_vpn_proxy(app_clone: tauri::AppHandle, running: HashSet<String>) -> Result<bool, String> {
-    match detect_vpn_proxy_all_browsers() {
-        Ok(extensions) => {
-            if !extensions.is_empty() {
-                let result = flag_supported_browser_with_vpn_extension(app_clone.clone(), 
-                running.clone(), extensions).unwrap_or(false);
-                return Ok(result);
+fn vpn_cache_set(items: Vec<serde_json::Value>) {
+    if let Ok(mut g) = VPN_EXT_CACHE.lock() {
+        *g = Some((items, std::time::Instant::now()));
+    }
+}
+
+fn get_vpn_extensions_cached() -> Vec<serde_json::Value> {
+    let now = std::time::Instant::now();
+    if let Ok(g) = VPN_EXT_CACHE.lock() {
+        if let Some((items, ts)) = g.as_ref() {
+            if now.duration_since(*ts) < VPN_CACHE_TTL {
+                return items.clone();
             }
         }
-        Err(e) => {
-            eprintln!("VPN detection thread: detection failed: {}", e);
+    }
+    Vec::new()
+}
+
+fn start_vpn_detector_worker() {
+    if let Ok(g) = VPN_WORKER_HANDLE.lock() {
+        if g.is_some() {
+            return;
         }
     }
-    Ok(false)
+
+    let stop = Arc::new(AtomicBool::new(false));
+    if let Ok(mut gs) = VPN_WORKER_STOP.lock() {
+        *gs = Some(stop.clone());
+    }
+
+    let handle = std::thread::spawn(move || {
+        if let Ok(items) = detect_vpn_proxy_all_browsers() {
+            vpn_cache_set(items);
+        }
+        loop {
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(VPN_CACHE_TTL);
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+
+            if let Ok(items) = detect_vpn_proxy_all_browsers() {
+                vpn_cache_set(items);
+            }
+        }
+    });
+
+    if let Ok(mut gh) = VPN_WORKER_HANDLE.lock() {
+        *gh = Some(handle);
+    }
+}
+
+fn stop_vpn_detector_worker() {
+    if let Ok(mut gs) = VPN_WORKER_STOP.lock() {
+        if let Some(flag) = gs.take() {
+            flag.store(true, Ordering::SeqCst);
+        }
+    }
+    
+    if let Ok(mut gh) = VPN_WORKER_HANDLE.lock() {
+        if let Some(h) = gh.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn flag_vpn_proxy(app_clone: tauri::AppHandle, running: HashSet<String>) -> Result<bool, String> {
+    let extensions = get_vpn_extensions_cached();
+    if extensions.is_empty() {
+        return Ok(false);
+    }
+
+    let result = flag_supported_browser_with_vpn_extension(app_clone.clone(), 
+        running.clone(), extensions).unwrap_or(false);
+    Ok(result)
 }
 
 #[tauri::command]
@@ -915,8 +969,6 @@ fn turn_on_settings_and_app_protection(app_handle: tauri::AppHandle) -> Result<b
     
     let mut guard = PROTECTION_HANDLE.lock().map_err(|e| e.to_string())?;
     if guard.is_some() {
-        let duration = start_time.elapsed();
-        println!("turn_on_settings_and_app_protection: completed in {:?} (already running)", duration);
         return Ok(true);
     }
 
@@ -926,8 +978,6 @@ fn turn_on_settings_and_app_protection(app_handle: tauri::AppHandle) -> Result<b
     let is_settings_protection_on = read_preferences_for_key(&app_handle.clone(), "blockSettingsSwitch").unwrap_or(false);
 
     if !is_settings_protection_on {
-        let duration = start_time.elapsed();
-        println!("turn_on_settings_and_app_protection: completed in {:?} (protection disabled)", duration);
         return Ok(false);
     }
 
@@ -941,25 +991,19 @@ fn turn_on_settings_and_app_protection(app_handle: tauri::AppHandle) -> Result<b
             let loop_start_time = std::time::Instant::now();
             
             if stop_flag.load(Ordering::SeqCst) {
-                println!("turn_on_settings_and_app_protection: protection loop stopped");
                 break;
             }
 
-            /*
             if is_pc_idle(2 * 60 * 1000).unwrap_or(false) {
-                println!("Pc is idle, sleeping:");
                 std::thread::sleep(interval);
                 continue;
             }
-             */
 
             if last_sync.elapsed() >= sync_interval {
                 let sync_start = std::time::Instant::now();
                 if let Err(e) = perform_sync_recovery(&app_clone) {
                     eprintln!("protection thread: sync/recovery failed: {}", e);
                 }
-                let sync_duration = sync_start.elapsed();
-                println!("turn_on_settings_and_app_protection: sync/recovery completed in {:?}", sync_duration);
                 last_sync = std::time::Instant::now();
             }
 
@@ -978,10 +1022,6 @@ fn turn_on_settings_and_app_protection(app_handle: tauri::AppHandle) -> Result<b
                     let _ = show_overlay(&app_clone, arguments);
                     has_flagged = true;
                 }
-                let titles_duration = titles_start.elapsed();
-                if titles_duration > Duration::from_millis(100) {
-                    println!("turn_on_settings_and_app_protection: flagged titles check took {:?}", titles_duration);
-                }
             }
 
             if !has_flagged {
@@ -995,7 +1035,6 @@ fn turn_on_settings_and_app_protection(app_handle: tauri::AppHandle) -> Result<b
                             has_flagged = flag_blocked_apps(app_clone.clone(), running.clone()).unwrap_or(false);
                         }
                         
-                        /*
                         if !has_flagged && is_dns_protection_on {
                             has_flagged = flag_proxies_and_dns_bypassers(app_clone.clone(), running.clone()).unwrap_or(false);
                         }
@@ -1003,18 +1042,8 @@ fn turn_on_settings_and_app_protection(app_handle: tauri::AppHandle) -> Result<b
                         if !has_flagged && is_supported_browser_running(running.clone()).unwrap_or(false) {
                             has_flagged = flag_vpn_proxy(app_clone.clone(), running.clone()).unwrap_or(false);
                         }
-                         */
-                        
-                        let process_check_duration = process_check_start.elapsed();
-                        if process_check_duration > Duration::from_millis(50) {
-                            println!("turn_on_settings_and_app_protection: process checks took {:?}", process_check_duration);
-                        }
                     }
                     Err(e) => eprintln!("protection thread: getting the running processes call failed: {}", e),
-                }
-                let processes_duration = processes_start.elapsed();
-                if processes_duration > Duration::from_millis(200) {
-                    println!("turn_on_settings_and_app_protection: get_running_process_names took {:?}", processes_duration);
                 }
             }
 
@@ -1032,13 +1061,7 @@ fn turn_on_settings_and_app_protection(app_handle: tauri::AppHandle) -> Result<b
     });
 
     *guard = Some(handle);
-    
-    let task_start = std::time::Instant::now();
     let _ = create_eagle_recurring_task();
-    let task_duration = task_start.elapsed();
-    
-    let total_duration = start_time.elapsed();
-    println!("turn_on_settings_and_app_protection: completed in {:?} (task creation: {:?})", total_duration, task_duration);
     
     Ok(true)
 }
@@ -1132,11 +1155,8 @@ fn detect_vpn_proxy_all_browsers() -> Result<Vec<serde_json::Value>, String> {
     let ps = r#"
     $ErrorActionPreference = 'SilentlyContinue'
     $result = @()
-
-    # Chromium-family (Brave/Chrome/Edge)
     $local = $env:LOCALAPPDATA
     $targets = @(
-        @{ Name='Brave'; Path=(Join-Path $local 'BraveSoftware\Brave-Browser\User Data\Default\extensions') },
         @{ Name='Chrome'; Path=(Join-Path $local 'Google\Chrome\User Data\Default\extensions') },
         @{ Name='Edge'; Path=(Join-Path $local 'Microsoft\Edge\User Data\Default\extensions') }
     )
@@ -1178,85 +1198,12 @@ fn detect_vpn_proxy_all_browsers() -> Result<Vec<serde_json::Value>, String> {
         }
     }
 
-    # Firefox in Roaming and Local
-    $paths = @(
-        (Join-Path $env:APPDATA 'Mozilla\Firefox\Profiles'),
-        (Join-Path $env:LOCALAPPDATA 'Mozilla\Firefox\Profiles')
-    )
-    foreach($p in $paths){
-        if(-not (Test-Path $p)){ continue }
-        # 1) Raw manifests on disk
-        Get-ChildItem $p -Recurse -Filter 'manifest.json' -ErrorAction SilentlyContinue | ForEach-Object {
-            try {
-                $mf = $_.FullName
-                $j = Get-Content $mf -Raw | ConvertFrom-Json
-                $perms = @()
-                if($j.permissions){ $perms = @($j.permissions) }
-                $hasProxy = $perms -contains 'proxy' -or $perms -contains 'webRequest'
-                $text = Get-Content $mf -Raw
-                $name = $j.name
-                $desc = $j.description
-                $home = $j.homepage_url
-                $isVPN = ($text -match '(?i)vpn|veepn') -or ($name -match '(?i)vpn') -or ($desc -match '(?i)vpn') -or ($home -match '(?i)vpn')
-                if($hasProxy -and $isVPN){
-                    $extId = Split-Path (Split-Path $mf -Parent) -Leaf
-                    $result += [pscustomobject]@{
-                        id = $extId
-                        name = $name
-                        version = $j.version
-                        homepage_url = $home
-                        description = $desc
-                        permissions = $perms
-                        browser = 'Firefox'
-                        has_proxy_permission = $hasProxy
-                        is_vpn = $true
-                        manifest_path = $mf
-                    }
-                }
-            } catch {}
-        }
-
-        # 2) Packed .xpi add-ons
-        try { Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null } catch {}
-        Get-ChildItem $p -Recurse -Filter '*.xpi' -ErrorAction SilentlyContinue | ForEach-Object {
-            try {
-                $zip = [System.IO.Compression.ZipFile]::OpenRead($_.FullName)
-                $entry = $zip.Entries | Where-Object { $_.FullName -eq 'manifest.json' -or $_.Name -eq 'manifest.json' } | Select-Object -First 1
-                if($entry){
-                    $sr = New-Object System.IO.StreamReader($entry.Open())
-                    $text = $sr.ReadToEnd(); $sr.Close(); $zip.Dispose()
-                    $j = $text | ConvertFrom-Json
-                    $perms = @(); if($j.permissions){ $perms = @($j.permissions) }
-                    $hasProxy = $perms -contains 'proxy' -or $perms -contains 'webRequest'
-                    $name = $j.name; $desc = $j.description; $home = $j.homepage_url
-                    $isVPN = ($text -match '(?i)vpn|veepn') -or ($name -match '(?i)vpn') -or ($desc -match '(?i)vpn') -or ($home -match '(?i)vpn')
-                    if($hasProxy -and $isVPN){
-                        $result += [pscustomobject]@{
-                            id = [System.IO.Path]::GetFileNameWithoutExtension($_.Name)
-                            name = $name
-                            version = $j.version
-                            homepage_url = $home
-                            description = $desc
-                            permissions = $perms
-                            browser = 'Firefox'
-                            has_proxy_permission = $hasProxy
-                            is_vpn = $true
-                            manifest_path = $_.FullName
-                        }
-                    }
-                } else { $zip.Dispose() }
-            } catch {}
-        }
-    }
-
     $result | ConvertTo-Json -Compress
     "#;
 
-    // Run the PowerShell path fully hidden
     if let Ok(out) = run_powershell_hidden(ps) {
         if out.status.success() {
             let mut s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            // Trim a possible BOM
             if s.starts_with('\u{feff}') {
                 s = s.trim_start_matches('\u{feff}').to_string();
             }
@@ -1267,7 +1214,6 @@ fn detect_vpn_proxy_all_browsers() -> Result<Vec<serde_json::Value>, String> {
                     }
                 }
             } else if s.starts_with('{') {
-                // In case a single object is returned
                 if let Ok(one) = serde_json::from_str::<serde_json::Value>(&s) {
                     return Ok(vec![one]);
                 }
@@ -1283,11 +1229,10 @@ fn detect_vpn_proxy_all_browsers() -> Result<Vec<serde_json::Value>, String> {
         .ok_or("APPDATA not found")?;
     let mut vpn_extensions = Vec::new();
     let browser_paths = vec![
-        ("Brave", base.clone(), "BraveSoftware\\Brave-Browser\\User Data\\Default\\extensions"),
         ("Chrome", base.clone(), "Google\\Chrome\\User Data\\Default\\extensions"),
         ("Edge", base.clone(), "Microsoft\\Edge\\User Data\\Default\\extensions"),
-        ("Firefox", appdata_base.clone(), "Mozilla\\Firefox\\Profiles"),
     ];
+
     for (browser_name, base_path, rel_path) in browser_paths {
         let mut full_path = base_path.clone();
         full_path.push(rel_path);
@@ -1437,8 +1382,8 @@ fn is_file_corrupted(path: &std::path::PathBuf) -> bool {
 
 fn resolve_prod_exe_path() -> Result<String, String> {
     let candidates = [
-        r"C:\Program Files\EagleBlocker\eagleblocker.exe",  // lowercase (actual file)
-        r"C:\Program Files\EagleBlocker\EagleBlocker.exe",   // capitalized (old reference)
+        r"C:\Program Files\EagleBlocker\eagleblocker.exe",
+        r"C:\Program Files\EagleBlocker\EagleBlocker.exe",
         r"C:\Program Files (x86)\EagleBlocker\eagleblocker.exe",
         r"C:\Program Files (x86)\EagleBlocker\EagleBlocker.exe",
     ];
@@ -1463,16 +1408,25 @@ fn enable_autostart(app_handle: tauri::AppHandle) -> Result<bool, String> {
     Ok(true)
 }
 
+fn stop_settings_protection_worker() {
+    if let Ok(mut gs) = PROTECTION_STOP.lock() {
+        if let Some(flag) = gs.take() {
+            flag.store(true, Ordering::SeqCst);
+        }
+    }
+    
+    if let Ok(mut gh) = PROTECTION_HANDLE.lock() {
+        if let Some(h) = gh.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 #[tauri::command]
 fn stop_settings_and_app_protection() -> Result<bool, String> {
     let _ = delete_all_eagle_tasks();
-    if let Some(flag) = PROTECTION_STOP.lock().map_err(|e| e.to_string())?.take() {
-        flag.store(true, Ordering::SeqCst);
-    }
-    let mut guard = PROTECTION_HANDLE.lock().map_err(|e| e.to_string())?;
-    if let Some(h) = guard.take() {
-        let _ = h.join();
-    }
+    stop_vpn_detector_worker();
+    stop_settings_protection_worker();
     Ok(true)
 }
 
@@ -2385,7 +2339,6 @@ fn create_eagle_recurring_task() -> Result<bool, String> {
     let task_name = "Eagle Recurring Start";
     if let Ok(q) = run_hidden_output("schtasks", &["/Query", "/TN", &task_name]) {
         if q.status.success() {
-            println!("Eagle Recurring Start task already exists, returning early");
             return Ok(true);
         }
     }
@@ -2404,7 +2357,6 @@ fn create_eagle_recurring_task() -> Result<bool, String> {
     let output = run_hidden_output("schtasks", &args).map_err(|e| format!("failed to spawn schtasks: {}", e))?;
     
     if output.status.success() {
-        println!("Successfully created recurring task schedule");
         Ok(true)
     } else {
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2456,25 +2408,19 @@ fn remove_eagle_task_schedule_simple() -> Result<bool, String> {
 }
 
 fn delete_eagle_task_schedule(task_name: &str) -> Result<bool, String> {
-    println!("delete_eagle_task_schedule: attempting to delete task '{}'", task_name);
-    
     let args = ["/Delete", "/TN", task_name, "/F"];
-    let output = run_hidden_output("schtasks", &args)
-        .map_err(|e| format!("failed to spawn schtasks delete: {}", e))?;
+    let output = run_hidden_output("schtasks", &args).map_err(|e| format!("failed to spawn schtasks delete: {}", e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     if output.status.success() {
-        println!("delete_eagle_task_schedule: successfully deleted task '{}'", task_name);
         Ok(true)
     } else {
         if stderr.to_lowercase().contains("cannot find") || stderr.to_lowercase().contains("not found") {
-            println!("delete_eagle_task_schedule: task '{}' not found (already deleted)", task_name);
             Ok(true)
         } else {
-            Err(format!("schtasks delete failed for '{}': code={:?}, stdout={}, stderr={}", 
-                task_name, output.status.code(), stdout, stderr))
+            Err(format!("schtasks delete failed for '{}': code={:?}, stdout={}, stderr={}", task_name, output.status.code(), stdout, stderr))
         }
     }
 }

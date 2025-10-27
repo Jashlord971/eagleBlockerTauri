@@ -59,6 +59,7 @@ impl BrowserDetector {
         }
     }
 
+    /*
     fn is_known_browser(&self, process_name: &str) -> bool {
         let lowercase = process_name.to_lowercase();
         self.known_browsers
@@ -258,6 +259,8 @@ impl BrowserDetector {
         let browser_keywords = ["browser", "web", "chrome", "firefox", "edge", "safari", "internet"];
         browser_keywords.iter().any(|keyword| lowercase.contains(keyword))
     }
+
+    */
 
     fn get_registered_browsers() -> Vec<String> {
         let mut browsers = Vec::new();
